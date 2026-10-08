@@ -9,6 +9,8 @@ Failures are returned explicitly and must never be recorded as empty snapshots.
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +24,7 @@ class FetchError(Exception):
     url: str
     message: str
     status: int | None = None
+    retry_after_seconds: float | None = None
 
     def __str__(self):
         return self.message
@@ -69,7 +72,21 @@ def fetch_snapshot(url: str, *, timeout: float = 20,
                 raise ValueError("Canonical snapshot must be a JSON object")
             return payload
     except urllib.error.HTTPError as exc:
-        return FetchError(url, f"HTTP {exc.code}", exc.code)
+        retry_after = None
+        if exc.code == 429:
+            value = exc.headers.get("Retry-After") if exc.headers else None
+            if value:
+                try:
+                    if value.strip().isdigit():
+                        retry_after = float(value.strip())
+                    else:
+                        date = parsedate_to_datetime(value)
+                        if date.tzinfo is None:
+                            date = date.replace(tzinfo=timezone.utc)
+                        retry_after = max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        return FetchError(url, f"HTTP {exc.code}", exc.code, retry_after)
     except (OSError, ValueError, urllib.error.URLError) as exc:
         # Do not expose upstream response bodies or credential-bearing redirect URLs.
         if isinstance(exc, urllib.error.URLError):

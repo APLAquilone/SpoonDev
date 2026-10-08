@@ -1,41 +1,59 @@
 # SpoonDev
 
-配信者とリスナーの関係を、ユーザーIDと観測日時をキーに SQLite に蓄積する Python 3.12 以降のツールです。表示名が同じ別ユーザーを区別し、名前変更履歴を保存します。集計は観測回数であり、視聴時間を意味しません。
+Spoon 日本版の公開配信・リスナー一覧を取得し、配信者とリスナーの関係と温度 (`favorite_temperature`) を時刻付きで SQLite に蓄積します。Python 3.12 以降と標準ライブラリ、バックグラウンド起動には Linux の `flock` を使います。
 
-## 現在の状態
+## 保存する情報
 
-DB、JSONインポート、双方向集計、制限付き並列HTTP取得、定期実行を実装しています。**Spoon のリスナー一覧APIは未検証で、Spoon固有の取得アダプターは未実装です。現時点で実サイトからの自動収集は完成していません。** サイトへの接続がネットワークプロキシで遮断され、公開範囲・IDフィールド・ページング・利用条件を確認できませんでした。
+- 数値のアカウントIDを主キーにします。同名の別ユーザーを区別できます。
+- プロフィールに表示されるID (`tag`) と表示名 (`nickname`) は別に履歴として保存します。ハンドルが将来変更されても数値IDで追跡します。
+- 配信ID、配信者ID、リスナーID、UTC観測日時、取得できた温度を保存します。温度は配信者とリスナーの関係ごとの観測値です。温度の計算方法は断定しません。
+- 全ページ取得と部分取得を区別します。取得失敗を「リスナー0人」や退出の証拠にしません。
 
-プロフィールに表示されるIDと内部IDが同じか、不変かも未確認です。取得元を検証してから一意で安定したアカウントIDを `id` に対応付けます。表示名やコメント投稿者、視聴者数からリスナーを推測しません。認証・閲覧制限の回避は行いません。
+取得できるのは API が公開するリスナーです。匿名・非表示リスナーの身元は分かりません。ページを取得する間にも入退室が起きるため、完全に同時刻の一覧ではありません。集計の回数は観測回数であり、実際の視聴時間ではありません。
 
-## 開発と動作確認
+## 開発・検証
 
-既存のチェックアウト `/workspace/SpoonDev` を使います。クラウドタスクは独立した環境なので worktree の追加は不要です。外部ランタイム依存パッケージやシークレットはありません。
+既存の `/workspace/SpoonDev` を使います。クラウドタスクは独立した環境なので worktree を追加する必要はありません。依存パッケージの導入やログイン、シークレットは不要です。
 
 ```sh
 cd /workspace/SpoonDev
 python -m unittest discover -s tests -v
-python -m spoondev --db /tmp/spoondev-demo.sqlite3 init-db
-python -m spoondev --db /tmp/spoondev-demo.sqlite3 import examples/snapshot.json
-python -m spoondev --db /tmp/spoondev-demo.sqlite3 report broadcaster fixture-host-1
-python -m spoondev --db /tmp/spoondev-demo.sqlite3 report listener fixture-listener-1
+python -m spoondev init-db
+python -m spoondev collect-spoon --max-rooms 3 --once
 ```
 
-サンプルは架空のデータです。本番DBに投入しないでください。同じ観測の再インポートは新しい観測として保存されるため、運用では取得イベントを重複投入しないでください。
+Spoon の Web クライアントが使う `https://jp-api.spooncast.net/lives/` と `/lives/{id}/listeners/` を実応答で確認しています。`next` の同一ホスト・同一パスのURLを巡回し、全ページのリスナーを取得します。配信終了やエラー時は部分観測か失敗として扱います。音声、メール、認証情報、APIの生レスポンスや room_token は保存しません。
 
-## 収集アダプターの契約
-
-`examples/snapshot.json` の形式のJSONを返す、検証済みの取得アダプターを用意します。1URLにつき1配信の観測です。`observed_at` は実際の取得時刻とタイムゾーンを含め、`complete` は全ページの取得が成功した場合のみ true とします。部分的に見えた参加者は false として保存できます。失敗は空一覧として保存しません。
+## 定期収集
 
 ```sh
-python -m spoondev collect --url https://YOUR-VERIFIED-ADAPTER.example/snapshot --once
-python -m spoondev collect --url https://YOUR-VERIFIED-ADAPTER.example/snapshot --interval 300 --concurrency 4
+python -m spoondev collect-spoon --max-rooms 0 --interval 300 --concurrency 4
 ```
 
-上のURLは例示であり実在する取得先ではありません。実サイトのURLや未確認のAPIをそのまま指定しても動きません。並列数は1〜16、取得周期は30秒以上です。実際にはサービスの利用条件・レート制限に従い、必要な対象と頻度に絞ってください。HTTPエラーのラウンドは保存せず、次の周期で再取得します。
+`--max-rooms 0` は配信一覧に載る全配信が対象です。既定値は10配信なので、全配信には明示的に0を指定します。ページ数の安全上限は各一覧100ページです。上限に達するとエラーを報告するため、全件取得を断言しません。配信ごとに並列取得し、同一ホストへのリクエスト開始には間隔を設けます。最低周期は30秒ですが、通常は5分以上にします。取得ラウンド完了後に指定時間待つため、厳密な時計上の5分周期ではありません。
 
-DBには `data/spoondev.sqlite3` を使い、Gitから除外します。アクセス権と保存期間は運用前に決め、不要な個人単位の履歴を保存し続けないでください。公開前提のデータでも分析結果の公開範囲は慎重に設定してください。
+バックグラウンド起動は以下です。ファイルロックにより同じDBのコレクターが二重起動するのを防ぎます。
 
-## 実データ取得までの残作業
+```sh
+bash scripts/start-collector.sh
+```
 
-環境設定で `www.spooncast.net` と候補APIホスト `jp-api.spooncast.net` の接続許可を反映後、サイトの公開リスナー一覧、安定ID、ページング、利用条件を確認します。APIホストは未検証の候補です。その実応答に合わせてアダプターを実装し、少数の配信で機能検証してから対象を増やします。
+ログは `data/collector.log`、DBは `data/spoondev.sqlite3` です。直近起動要求のPIDは `data/collector.last-start.pid` にあります。二重起動の要求は終了するため、PIDの存在だけで稼働判定せず、ログとDBに新しい観測があることを確認します。終了には稼働中の `python -m spoondev ... collect-spoon` プロセスにSIGINTかSIGTERMを送ります。クラウド環境の停止・再作成・Publishでプロセスは維持されません。保存した起動手順に従って再起動してください。この開発環境が常時稼働サーバーになる保証はありません。
+
+## 集計と温度履歴
+
+```sh
+python -m spoondev report broadcaster NUMERIC_BROADCASTER_ID
+python -m spoondev report listener NUMERIC_LISTENER_ID
+python -m spoondev history NUMERIC_BROADCASTER_ID NUMERIC_LISTENER_ID
+```
+
+`report` は観測回数、初回/最終観測、プロフィールID、最後に取得できた温度を返します。欠測は0と扱いません。温度の取得日時は `history` で確認できます。履歴には未取得の温度も null として現れます。
+
+任意のDBには `python -m spoondev --db /path/to/db.sqlite3 ...` を使います。`examples/snapshot.json` は架空のデータで、本番DBにインポートしないでください。JSONインポートと、検証済みJSONアダプター向けの汎用 `collect --url ...` も利用できます。同じ観測の再インポートは新しい観測として記録されます。
+
+## 接続と運用上の制約
+
+必要な接続先は `www.spooncast.net` と `jp-api.spooncast.net` です。公式Webクライアントが参照する利用規約・プライバシーのホストは `spoonvip.oopy.io` と `spoon-privacy.oopy.io` で、接続許可を設定ドラフトに追加しています。現在、その規約ホストへの接続はプロキシ403で遮断され、規約本文は未確認です。公開APIへのアクセス成功は大規模・長期収集の利用許可を意味しません。長期運用前に利用条件を確認してください。
+
+DBとログはGitから除外しています。個人単位の行動履歴を含むため、アクセス範囲と必要な保存期間を決めて運用してください。データや分析結果は自動公開しません。

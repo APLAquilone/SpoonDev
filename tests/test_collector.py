@@ -1,4 +1,6 @@
 import json
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import time
@@ -18,6 +20,12 @@ class Handler(BaseHTTPRequestHandler):
     lock = threading.Lock()
 
     def do_GET(self):
+        if self.path in {"/limited", "/limited-date"}:
+            self.send_response(429)
+            value = "120" if self.path == "/limited" else format_datetime(datetime.now(timezone.utc) + timedelta(seconds=120), usegmt=True)
+            self.send_header("Retry-After", value)
+            self.end_headers()
+            return
         if self.path == "/error":
             self.send_error(503)
             return
@@ -69,6 +77,17 @@ class CollectorTests(unittest.TestCase):
 
     def test_size_limit(self):
         self.assertIsInstance(fetch_snapshot(self.base + "/ok", max_response_bytes=8), FetchError)
+
+    def test_retry_after_seconds(self):
+        error = fetch_snapshot(self.base + "/limited")
+        self.assertEqual(error.status, 429)
+        self.assertEqual(error.retry_after_seconds, 120)
+
+    def test_retry_after_http_date(self):
+        error = fetch_snapshot(self.base + "/limited-date")
+        self.assertEqual(error.status, 429)
+        self.assertGreater(error.retry_after_seconds, 118)
+        self.assertLessEqual(error.retry_after_seconds, 120)
 
     def test_plain_remote_http_rejected(self):
         self.assertIsInstance(fetch_snapshot("http://example.invalid/data"), FetchError)
