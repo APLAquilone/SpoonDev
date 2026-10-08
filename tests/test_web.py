@@ -3,6 +3,11 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from spoondev import profiledb
+from spoondev.directory import DirectoryError
 from urllib.error import HTTPError
 from urllib.request import urlopen, Request
 
@@ -56,3 +61,24 @@ class WebTests(unittest.TestCase):
                     urlopen(self.base+path,timeout=5)
                 self.assertEqual(error.exception.code,status)
                 self.assertIn('error',json.load(error.exception))
+
+    def test_unobserved_directory_user_and_monthly_appearances(self):
+        remote={'users':[{'id':'99','name':'未観測ユーザー','tag':'remote','last_seen_at':None}],
+                'has_more':False,'source':'spoon_public_search'}
+        with patch('spoondev.directory.search_users',return_value=remote):
+            self.assertEqual(self.get('/api/users?q=remote&scope=spoon')['users'][0]['id'],'99')
+        self.assertEqual(self.get('/api/users/99')['broadcasters'],[])
+        profiledb.save_profile(self.db,{'id':'99','name':'未観測ユーザー','tag':'remote'},
+            [{'id':'1','name':'Host','temperature':65}],
+            datetime.now(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m'),True)
+        result=self.get('/api/users/99')
+        self.assertEqual(result['appearances'][0]['user_id'],'1')
+        self.assertEqual(result['appearances'][0]['temperature'],65)
+        self.assertEqual(result['appearances'][0]['source'],'monthly_profile')
+
+    def test_directory_failure_is_reported_with_cached_results(self):
+        with patch('spoondev.directory.search_users',side_effect=DirectoryError('Network unavailable')):
+            result=self.get('/api/users?q=Host&scope=spoon')
+        self.assertEqual(result['source'],'local_fallback')
+        self.assertIn('warning',result)
+        self.assertEqual(result['users'][0]['id'],'1')

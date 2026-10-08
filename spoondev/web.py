@@ -6,12 +6,14 @@ import sqlite3
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import webdata
+from . import profiledb
 
 
 def make_server(database, host='127.0.0.1', port=8080):
     database = str(Path(database).resolve())
     if not Path(database).is_file():
         raise FileNotFoundError('Database not found; run init-db or collect-spoon first')
+    profiledb.initialize(database)
 
     class Handler(BaseHTTPRequestHandler):
         def respond(self, status, body, content_type='application/json; charset=utf-8'):
@@ -43,12 +45,32 @@ def make_server(database, host='127.0.0.1', port=8080):
                     offset = int(query.get('offset',['0'])[0])
                     if len(term) > 200 or not 0 <= offset <= 1000000:
                         raise ValueError('Invalid search parameter')
-                    self.respond(200, webdata.search_users(database, term, limit=50, offset=offset))
+                    if query.get('scope',['local'])[0] == 'spoon' and term:
+                        from .directory import search_users, DirectoryError
+                        try:
+                            result = search_users(term,offset=offset,limit=50)
+                            profiledb.cache_users(database,[{key:u.get(key) for key in ('id','name','tag')} for u in result['users']])
+                        except DirectoryError as exc:
+                            result = webdata.search_users(database,term,limit=50,offset=offset)
+                            result['warning'] = str(exc)+' 保存済みデータの検索結果を表示しています。'
+                            result['source'] = 'local_fallback'
+                        self.respond(200,result)
+                    else:
+                        self.respond(200, webdata.search_users(database, term, limit=50, offset=offset))
                 elif route.path.startswith('/api/users/'):
                     user_id = unquote(route.path[len('/api/users/'):])
                     if not user_id or len(user_id) > 200 or '/' in user_id:
                         raise ValueError('Invalid account ID')
                     user = webdata.user_details(database, user_id)
+                    if user is None and user_id.isascii() and user_id.isdigit():
+                        from .directory import resolve_user, DirectoryError
+                        try:
+                            remote = resolve_user(user_id)
+                            profiledb.cache_users(database,[{key:remote.get(key) for key in ('id','name','tag')}])
+                            user = webdata.user_details(database,user_id)
+                        except DirectoryError:
+                            self.respond(502,{'error':'Spoonのプロフィールを取得できませんでした。ユーザーが存在しないとは限りません。'})
+                            return
                     self.respond(200,user) if user is not None else self.respond(404,{'error':'ユーザーが見つかりません。'})
                 elif route.path == '/api/history':
                     broadcaster = query.get('broadcaster_id',[''])[0]

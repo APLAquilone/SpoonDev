@@ -52,7 +52,7 @@ class WebDataTests(unittest.TestCase):
         self.assertEqual(listener['listeners'],[])
         self.assertEqual(len(user_details(self.path,'100')['listeners']),2)
         self.assertIsNone(user_details(self.path,'missing'))
-        self.assertEqual(stats(self.path),{'user_count':3,'snapshot_count':1,'last_observed_at':'2026-10-09T00:00:00.000000+00:00'})
+        self.assertEqual(stats(self.path),{'user_count':3,'snapshot_count':1,'last_observed_at':'2026-10-09T00:00:00.000000+00:00','monthly_indexed_djs':0})
         self.assertEqual(history(self.path,'100','200')[0]['favorite_temperature'],46)
         self.assertEqual(history(self.path,'other','200'),[])
 

@@ -36,13 +36,21 @@ def main(argv=None):
     spoon.add_argument("--max-rooms", type=int, default=10, help="Maximum rooms per round; use 0 for all listed rooms")
     spoon.add_argument("--max-pages", type=int, default=100)
     spoon.add_argument("--once", action="store_true")
+    monthly = commands.add_parser('collect-monthly', help='Index current-month public DJ rankings as listener appearances')
+    monthly.add_argument('--max-djs',type=int,default=100,help='0 scans all known broadcasters')
+    monthly.add_argument('--max-pages',type=int,default=100)
+    monthly.add_argument('--concurrency',type=int,default=4)
+    monthly.add_argument('--interval',type=float,default=3600)
+    monthly.add_argument('--once',action='store_true')
     args = parser.parse_args(argv)
     if args.command == 'serve' and not 0 <= args.port <= 65535:
         parser.error('port must be 0..65535')
-    if args.command in {"collect", "collect-spoon"} and (not 1 <= args.concurrency <= 16 or args.interval < 30):
+    if args.command in {"collect", "collect-spoon",'collect-monthly'} and (not 1 <= args.concurrency <= 16 or args.interval < 30):
         parser.error("concurrency must be 1..16; interval must be at least 30 seconds")
     if args.command == "collect-spoon" and (args.max_rooms < 0 or args.max_pages < 1):
         parser.error("max-rooms must be nonnegative; max-pages must be positive")
+    if args.command == 'collect-monthly' and (args.max_djs < 0 or args.max_pages < 1):
+        parser.error('max-djs must be nonnegative; max-pages must be positive')
     try:
         if args.command == 'serve':
             from .web import serve
@@ -67,6 +75,15 @@ def main(argv=None):
                 signal.signal(sig, lambda *_: stopped.set())
             while not stopped.is_set():
                 failed = False
+                if args.command == 'collect-monthly':
+                    from .monthly import collect_monthly
+                    summary=collect_monthly(args.db,max_djs=args.max_djs,concurrency=args.concurrency,max_pages=args.max_pages,
+                        progress_callback=lambda progress: print(json.dumps(progress),flush=True),stopped_event=stopped)
+                    print(json.dumps(summary,ensure_ascii=False),flush=True)
+                    if args.once:
+                        return 1 if summary['errors'] else 0
+                    stopped.wait(max(args.interval,summary.get('retry_after',0)))
+                    continue
                 if args.command == "collect-spoon":
                     from .spoon import collect_spoon, SpoonRateLimit
                     try:
