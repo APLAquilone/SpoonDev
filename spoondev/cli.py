@@ -14,6 +14,9 @@ def main(argv=None):
     parser.add_argument("--db", default="data/spoondev.sqlite3")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init-db")
+    web = commands.add_parser("serve", help="Start the read-only search website")
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8080)
     imp = commands.add_parser("import")
     imp.add_argument("file", type=Path)
     report = commands.add_parser("report")
@@ -34,11 +37,17 @@ def main(argv=None):
     spoon.add_argument("--max-pages", type=int, default=100)
     spoon.add_argument("--once", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == 'serve' and not 0 <= args.port <= 65535:
+        parser.error('port must be 0..65535')
     if args.command in {"collect", "collect-spoon"} and (not 1 <= args.concurrency <= 16 or args.interval < 30):
         parser.error("concurrency must be 1..16; interval must be at least 30 seconds")
     if args.command == "collect-spoon" and (args.max_rooms < 0 or args.max_pages < 1):
         parser.error("max-rooms must be nonnegative; max-pages must be positive")
     try:
+        if args.command == 'serve':
+            from .web import serve
+            serve(args.db,args.host,args.port)
+            return 0
         Path(args.db).parent.mkdir(parents=True, exist_ok=True)
         initialize(args.db)
         if args.command == "init-db":
