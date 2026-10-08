@@ -1,0 +1,10 @@
+{
+  "room_id": "fixture-room-1",
+  "broadcaster": {"id": "fixture-host-1", "name": "サンプル配信者"},
+  "listeners": [
+    {"id": "fixture-listener-1", "name": "同じ表示名"},
+    {"id": "fixture-listener-2", "name": "同じ表示名"}
+  ],
+  "complete": true,
+  "observed_at": "2026-10-09T00:00:00+00:00"
+}

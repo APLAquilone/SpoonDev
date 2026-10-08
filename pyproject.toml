@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spoondev"
+version = "0.1.0"
+description = "Stable-ID broadcaster and listener observation database"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+spoondev = "spoondev.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["spoondev*"]
