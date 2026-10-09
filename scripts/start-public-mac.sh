@@ -21,6 +21,25 @@ web_pid=''; tunnel_pid=''; awake_pid=''
 cleanup(){ for pid in "$web_pid" "$tunnel_pid" "$awake_pid"; do if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi; done; rm -rf "$public_tmp"; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
+if [ -f data/public-tunnel.json ]; then
+    public_url=$(python - <<'PYCONFIG'
+import json,re
+from pathlib import Path
+from urllib.parse import urlsplit
+c=json.loads(Path('data/public-tunnel.json').read_text())
+u=urlsplit(c['url'])
+if u.scheme!='https' or not u.hostname or u.path not in ('','/') or u.query or u.fragment or u.username or u.port: raise SystemExit('Invalid HTTPS origin')
+if not re.fullmatch(r'[0-9a-fA-F-]{36}',c['tunnel_id']): raise SystemExit('Invalid tunnel UUID')
+p=Path(c['credentials_file']).expanduser().resolve()
+if not p.is_file(): raise SystemExit('Tunnel credentials file missing')
+config={'tunnel':c['tunnel_id'],'credentials-file':str(p),'ingress':[{'hostname':u.hostname,'service':'http://127.0.0.1:8080'},{'service':'http_status:404'}]}
+Path('data/named-tunnel-config.json').write_text(json.dumps(config));Path('data/named-tunnel-config.json').chmod(0o600)
+print('https://'+u.netloc)
+PYCONFIG
+)
+    cloudflared --config data/named-tunnel-config.json tunnel run > "$public_tmp/tunnel.log" 2>&1 &
+    tunnel_pid=$!
+else
 printf '{}\n' > "$public_tmp/config.yml"
 cloudflared --config "$public_tmp/config.yml" tunnel --url http://127.0.0.1:8080 --no-autoupdate > "$public_tmp/tunnel.log" 2>&1 &
 tunnel_pid=$!
@@ -35,6 +54,7 @@ for _ in range(120):
 else: raise SystemExit('Tunnel failed to start. Check network connectivity and retry.')
 PY
 )
+fi
 python -m spoondev serve --auth --host 127.0.0.1 --port 8080 --public-url "$public_url" &
 web_pid=$!
 python - <<'PY'

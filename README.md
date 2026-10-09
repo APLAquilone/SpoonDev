@@ -153,3 +153,53 @@ bash scripts/start-public-mac.sh
 「ファン一覧」の「ファン一覧の設定を解除」は確認後に、ログイン中の利用者・選択中の配信者の紐付けと登録ファンを削除し、設定を初期化します。ファン0人でも解除できます。お気に入り、観測・温度の記録、他アカウントのファン一覧は残ります。取り消しはできませんが一覧を再取り込みできます。
 
 既存ローカル登録の移行 `--claim-local-data` は `kitomoya` 専用です。新規ログインユーザーには配信者を自動設定しません。すでに誤って引き継いだ登録がある場合は、そのログインで「ファン一覧の設定を解除」を押すと紐付けを解除できます。
+
+### 開発用と公開用を分ける（Mac）
+
+`~/SpoonDev` を公開用、`~/SpoonDev-dev` を開発用にします。公開側の収集・ログインDBはそのまま保持します。初回は公開用フォルダから実行します。
+
+```bash
+cd ~/SpoonDev
+bash scripts/prepare-dev-mac.sh
+cd ~/SpoonDev-dev
+python -m spoondev create-user kitomoya
+bash scripts/start-dev-mac.sh
+```
+
+開発画面は `http://127.0.0.1:8081`。ログインは開発用に作成したものです。観測DBだけ初回にSQLite backupでコピーし、ファン紐付けを除去します。accounts.sqlite3・account-data・ログインセッションはコピーしません。以降は開発用DBと公開用DBが独立しています。開発側で `pip install -e .` をし直す必要はありません。各フォルダで `python -m spoondev` を実行してください。
+
+変更を開発側で確認・コミットしたら、公開用のWebターミナルだけCtrl+Cで停止します（収集は継続できます）。
+
+```bash
+cd ~/SpoonDev-dev
+# 変更したファイルを選択して git add し、git commit してから実行
+bash scripts/release-mac.sh
+cd ~/SpoonDev
+bash scripts/start-public-mac.sh
+```
+
+releaseは開発側のテストを実行し、両フォルダに未コミット変更がないこと・公開Webが停止していることを確認してから、コミット済みコードをfast-forwardで反映します。公開データはコピー・削除しません。公開側でも独自にコミットして分岐した場合は停止するため、開発側で先に統合してください。公開側だけでgit pullすると開発側より先へ進むことがあるので、開発側で取り込んで確認してからreleaseしてください。
+
+### 再起動しても変わらない公開URL
+
+Quick Tunnelの `trycloudflare.com` URLは固定できません。固定URLはCloudflareで管理する独自ドメインと、無料の名前付きTunnelを使用します。Tunnel利用料は無料ですが、ドメインを持っていない場合は取得・更新料金が別途必要です。CloudflareアカウントへのログインとDNS設定は本人のブラウザで行います。
+
+ドメインをCloudflareで管理したら、公開用Macで以下を実行します（`spoon.example.com` は自分のドメインに置き換える）。
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create spoondev
+cloudflared tunnel route dns spoondev spoon.example.com
+```
+
+作成時に表示されるTunnel UUID・認証JSONのパスを使い、`~/SpoonDev/data/public-tunnel.json` を次の形式で保存します。実際の認証JSONやトークンはGitやチャットに貼らないでください。
+
+```json
+{
+  "url": "https://spoon.example.com",
+  "tunnel_id": "作成時のTunnel UUID",
+  "credentials_file": "/Users/自分のMacユーザー名/.cloudflared/Tunnel UUID.json"
+}
+```
+
+`bash scripts/start-public-mac.sh` はこの設定があれば固定URLのTunnelを使い、なければ従来の一時URLを使います。設定は公開用だけに置きます。再起動・リリースでURLは変わりません。Macが停止するとアクセスできなくなる点は同じです。このLinuxクラウドではMac・本人のCloudflareアカウントによる固定URLの実接続は未検証です。
