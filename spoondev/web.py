@@ -145,6 +145,9 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
             except ValueError:self.respond(400,{'error':'リクエストを確認してください。'})
 
         def _get(self):
+            if len(self.path) > 4096:
+                self.respond(414, {'error':'リクエストが長すぎます。'})
+                return
             path=urlsplit(self.path).path
             if auth and path=='/login':
                 self.respond(200,Path(__file__).with_name('static').joinpath('login.html').read_bytes(),'text/html; charset=utf-8'); return
@@ -171,6 +174,17 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
             if auth and path=='/api/dashboard':
                 from .dashboard import summary
                 self.respond(200,summary(database,self.private_db));return
+            if path=='/api/analytics':
+                if not auth:
+                    self.respond(401,{'error':'時間帯別の集計にはログインが必要です。'});return
+                query=parse_qs(urlsplit(self.path).query,max_num_fields=1,keep_blank_values=True)
+                if set(query)-{'days'} or any(len(values)!=1 for values in query.values()):
+                    raise ValueError('Invalid analytics parameter')
+                days=int(query.get('days',['7'])[0])
+                if days not in (7,28):
+                    raise ValueError('Invalid analytics window')
+                from .analytics import summary
+                self.respond(200,summary(database,self.private_db,days=days));return
             if auth and path=='/api/admin/users':
                 result=accounts.list_users(auth_database)
                 for user in result:
@@ -183,9 +197,6 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 self.respond(200,{'labels':[row['name'] for row in rows],'items':rows});return
             if auth and path=='/api/favorites':
                 self.respond(200,accounts.favorites(self.private_db)); return
-            if len(self.path) > 4096:
-                self.respond(414, {'error':'リクエストが長すぎます。'})
-                return
             route = urlsplit(self.path)
             try:
                 query = parse_qs(route.query, max_num_fields=10)
@@ -231,6 +242,9 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                     self.respond(200,result)
                 elif route.path == '/fan-export.js':
                     self.respond(200, Path(__file__).with_name('static').joinpath('fan-export.js').read_bytes(), 'text/javascript; charset=utf-8')
+                elif route.path in ('/theme.css','/analytics.js'):
+                    content_type='text/css; charset=utf-8' if route.path.endswith('.css') else 'text/javascript; charset=utf-8'
+                    self.respond(200,Path(__file__).with_name('static').joinpath(route.path[1:]).read_bytes(),content_type)
                 elif route.path == '/api/favorites/activity':
                     ids = query.get('ids', [''])[0]
                     result=webdata.favorite_activity(database, ids.split(',') if ids else [])
