@@ -18,7 +18,7 @@ PY
 umask 077
 public_tmp=$(mktemp -d)
 web_pid=''; tunnel_pid=''; awake_pid=''
-cleanup(){ for pid in "$web_pid" "$tunnel_pid" "$awake_pid"; do if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi; done; rm -rf "$public_tmp"; }
+cleanup(){ for pid in "$web_pid" "$tunnel_pid" "$awake_pid"; do if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi; done; rm -rf "$public_tmp"; rm -f data/public-run.json; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 if [ -f data/public-tunnel.json ]; then
@@ -55,8 +55,11 @@ else: raise SystemExit('Tunnel failed to start. Check network connectivity and r
 PY
 )
 fi
-python -m spoondev serve --auth --host 127.0.0.1 --port 8080 --public-url "$public_url" &
-web_pid=$!
+start_web(){
+    python -m spoondev serve --auth --host 127.0.0.1 --port 8080 --public-url "$public_url" &
+    web_pid=$!
+}
+start_web
 python - <<'PY'
 import time,urllib.request,urllib.error
 for _ in range(40):
@@ -69,4 +72,27 @@ else: raise SystemExit('Authenticated web server did not become ready')
 PY
 if command -v caffeinate >/dev/null; then caffeinate -i -w "$web_pid" & awake_pid=$!; fi
 printf '\nOpen this URL and log in: %s\nKeep this terminal open. Ctrl+C stops public access.\n' "$public_url"
-wait "$web_pid"
+reload_requested=0
+request_reload(){ reload_requested=1; kill "$web_pid" 2>/dev/null || true; }
+trap request_reload HUP
+python - "$$" "$public_url" <<'PYSTATE'
+import json,subprocess,sys
+from pathlib import Path
+pid=sys.argv[1]
+state={'pid':int(pid),'started':subprocess.check_output(['ps','-p',pid,'-o','lstart='],text=True).strip(),'root':str(Path.cwd().resolve()),'url':sys.argv[2]}
+Path('data/public-run.json').write_text(json.dumps(state));Path('data/public-run.json').chmod(0o600)
+PYSTATE
+while true; do
+    status=0
+    wait "$web_pid" || status=$?
+    if [ "$reload_requested" -eq 1 ]; then
+        # Wait until the old worker releases its port before starting its replacement.
+        wait "$web_pid" 2>/dev/null || true
+        reload_requested=0
+        start_web
+        if command -v caffeinate >/dev/null; then caffeinate -i -w "$web_pid" & awake_pid=$!; fi
+        printf '\nWeb reloaded. Public URL unchanged: %s\n' "$public_url"
+    else
+        exit "$status"
+    fi
+done

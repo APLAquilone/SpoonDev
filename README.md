@@ -1,4 +1,4 @@
-# Spoon Insights
+# Spoon Connection Insights (SCI)
 
 Spoon 日本版の公開配信・リスナー一覧を取得し、配信者とリスナーの関係と温度 (`favorite_temperature`) を時刻付きで SQLite に蓄積します。Python 3.12 以降と標準ライブラリ、バックグラウンド起動には Linux の `flock` を使います。
 
@@ -232,3 +232,18 @@ Devの一覧で「最近のライブ観測」は直近30分に限定し、詳細
 Devナビゲーションの「データの取得範囲」画面に、ライブ・月間・ON AIR・検索・ファン登録・お気に入りの対象と更新頻度を掲載しました。標準収集は1巡完了後にライブ5分／月間1時間待機し、画面の30秒更新とは別です。設定引数、ページ上限、エラー、Mac停止、Spoon側更新による遅れも明記しています。公開環境で起きた月間欠損の診断には公開環境のDB・収集ログを使い、Devコピーとの差を原因と断定しないでください。
 
 表示上の製品名は Spoon Insights です。既存のCLI `spoondev`、リポジトリ・Macのフォルダ名 SpoonDev、DBと保存キーは互換性のため維持します。
+
+### SCIの本番更新とURL維持
+
+製品名は **Spoon Connection Insights (SCI)**。管理コンソール・初回パスワード変更・並び替え・取得範囲説明を本番mainへ反映しました。CLIとフォルダ名は既存のままです。
+
+新しい `start-public-mac.sh` は、Tunnelを動かしたままWebプロセスだけ再起動できます。公開用フォルダでコードを更新した後、別ターミナルから `bash scripts/reload-public-mac.sh` を実行します。ログインDB・観測DBを保持し、同じURLを使います。ただし古い起動スクリプトで動いているプロセスにはこの機能がありません。初回だけ停止・起動が必要で、そのときQuick Tunnel URLは変わります。以降は同じ起動ターミナルを保持したWeb再起動ならURLを維持できます。Mac再起動・Tunnel切断・Ctrl+Cでの全停止後までURLを保証する機能ではありません。恒久的な固定URLには名前付きTunnelと独自ドメインを使用してください。
+
+```bash
+cd ~/SpoonDev
+git pull --ff-only
+# 新しい起動スクリプトで動いている場合のみ：
+bash scripts/reload-public-mac.sh
+```
+
+今回のアップグレード初回は、既存ユーザーもパスワード変更が必要です。管理権限はラベルとは別で、`python -m spoondev set-role <ID> admin` で明示的に付与できます。
