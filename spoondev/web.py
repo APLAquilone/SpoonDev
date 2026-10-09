@@ -83,7 +83,14 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
             if not auth: return True
             if public_url and self.headers.get('Host')!=urlsplit(public_url).netloc:
                 self.respond(403,{'error':'Invalid host'}); return False
-            if self.actor(): return True
+            if self.actor():
+                path=urlsplit(self.path).path
+                if self.user['must_change'] and path not in ('/password','/api/password','/api/logout'):
+                    self.respond(303 if not path.startswith('/api/') else 403,{'error':'パスワードを変更してください。','password_change_required':True},headers={'Location':'/password'})
+                    return False
+                if path.startswith('/api/admin/') and self.user['role']!='admin':
+                    self.respond(403,{'error':'管理者のみ操作できます。'});return False
+                return True
             self.respond(303 if urlsplit(self.path).path=='/' else 401,{'error':'ログインしてください。'},headers={'Location':'/login'})
             return False
 
@@ -92,6 +99,10 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
             if auth and path=='/login':
                 self.respond(200,Path(__file__).with_name('static').joinpath('login.html').read_bytes(),'text/html; charset=utf-8'); return
             if not self.gate(): return
+            if auth and path=='/password':
+                self.respond(200,Path(__file__).with_name('static').joinpath('password.html').read_text().replace('CSRF_TOKEN',self.user['csrf']).encode(),'text/html; charset=utf-8');return
+            if auth and path=='/api/admin/users':
+                self.respond(200,accounts.list_users(auth_database));return
             if auth and path=='/api/favorites':
                 self.respond(200,accounts.favorites(self.private_db)); return
             if len(self.path) > 4096:
@@ -103,14 +114,14 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 if route.path == '/':
                     html=Path(__file__).with_name('static').joinpath('index.html').read_text()
                     if auth:
-                        self.user['can_view_stats']=self.user['username']=='kitomoya'
+                        self.user['can_view_stats']=self.user['role']=='admin'
                         if not self.user['can_view_stats']:
                             html=html.replace('id="stats"','id="stats" hidden')
                         bootstrap=json.dumps(self.user).replace('<','\\u003c')
                         html=html.replace('<script>','<script>window.spoondevAccount='+bootstrap+';</script><script>',1)
                     self.respond(200,html.encode(),'text/html; charset=utf-8')
                 elif route.path == '/api/stats':
-                    if auth and self.user['username']!='kitomoya':
+                    if auth and self.user['role']!='admin':
                         self.respond(403,{'error':'集計情報は管理者のみ閲覧できます。'})
                     else:
                         self.respond(200, webdata.stats(database))
@@ -127,7 +138,7 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                     offset = int(query.get('offset', ['0'])[0])
                     if not 0 <= offset <= 1000000:
                         raise ValueError('Invalid offset')
-                    self.respond(200, webdata.fan_destinations(database, owner_id, offset=offset, private_database=self.private_db if auth else None))
+                    self.respond(200, webdata.fan_destinations(database, owner_id, offset=offset, private_database=self.private_db if auth else None, sort=query.get('sort',['recent'])[0]))
                 elif route.path == '/fan-export.js':
                     self.respond(200, Path(__file__).with_name('static').joinpath('fan-export.js').read_bytes(), 'text/javascript; charset=utf-8')
                 elif route.path == '/api/favorites/activity':
@@ -180,7 +191,7 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
 
         def do_POST(self):
             path=urlsplit(self.path).path
-            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
+            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites','/api/password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
                 self.respond(405,{'error':'この操作は利用できません。'}); return
             if path!='/api/login' and not self.gate(): return
             origin=self.headers.get('Origin')
@@ -217,7 +228,18 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 if path=='/api/logout':
                     accounts.logout(auth_database,self.token)
                     self.respond(200,{'ok':True},headers={'Set-Cookie':'spoondev_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'+('; Secure' if public_url else '')}); return
-                if path=='/api/favorites':
+                if path=='/api/password':
+                    result=accounts.change_password(auth_database,self.user['id'],payload.get('current_password'),payload.get('new_password'))
+                    self.respond(200,result,headers={'Set-Cookie':'spoondev_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'+('; Secure' if public_url else '')});return
+                if path=='/api/admin/users/create':
+                    uid=accounts.create(auth_database,payload.get('username'),payload.get('password'),label=payload.get('label','保守'))
+                    result={'id':uid}
+                elif path=='/api/admin/users/label':
+                    result=accounts.set_label(auth_database,payload.get('id'),payload.get('label'))
+                elif path=='/api/admin/users/delete':
+                    if payload.get('confirm') is not True: raise ValueError('削除を確認してください。')
+                    result=accounts.delete_user(auth_database,payload.get('id'))
+                elif path=='/api/favorites':
                     result=accounts.favorites(self.private_db,payload)
                     if result is None:
                         self.respond(409,{'error':'別の画面で更新されました。再読み込みしてください。'}); return

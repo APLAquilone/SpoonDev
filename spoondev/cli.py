@@ -24,6 +24,7 @@ def main(argv=None):
     account.add_argument('username')
     account.add_argument('--auth-db',default='data/accounts.sqlite3')
     account.add_argument('--reset',action='store_true')
+    account.add_argument('--label',default='保守')
     account.add_argument('--claim-local-data',action='store_true')
     imp = commands.add_parser("import")
     imp.add_argument("file", type=Path)
@@ -67,7 +68,7 @@ def main(argv=None):
                 raise ValueError('--claim-local-data は kitomoya の既存登録移行専用です。追加ユーザーには付けないでください。')
             password=getpass.getpass('Password (12+ characters): ')
             if password!=getpass.getpass('Confirm password: '): raise ValueError('パスワードが一致しません。')
-            uid=accounts.create(args.auth_db,args.username,password,args.reset)
+            uid=accounts.create(args.auth_db,args.username,password,args.reset,label=args.label)
             if args.claim_local_data: accounts.claim(args.auth_db,uid,args.db)
             print('Account saved: '+args.username)
             return 0

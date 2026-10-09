@@ -15,6 +15,18 @@ class FanTests(unittest.TestCase):
     def put(self,followers,complete=False):
         return fans.import_followers(self.db,{'owner':self.owner,'followers':followers,'complete':complete})
 
+    def test_sort_all_fans_before_pagination(self):
+        self.put([{'id':str(i+100),'name':f'Name {60-i:02d}'} for i in range(60)],True)
+        first=webdata.fan_destinations(self.db,'10',sort='name')
+        last=webdata.fan_destinations(self.db,'10',offset=50,sort='name')
+        names=[u['name'] for u in first['fans']+last['fans']]
+        self.assertEqual(names,sorted(names));self.assertEqual(len(names),60)
+        desc=webdata.fan_destinations(self.db,'10',sort='name_desc')['fans']
+        self.assertEqual(desc[0]['name'],'Name 60')
+        ids=webdata.fan_destinations(self.db,'10',sort='id')['fans']
+        self.assertEqual([u['id'] for u in ids],[str(i) for i in range(100,150)])
+        with self.assertRaises(ValueError):webdata.fan_destinations(self.db,'10',sort='name; DROP TABLE users')
+
     def test_partial_merges_full_replaces_and_empty_full_clears(self):
         self.put([{'id':'20','name':'same'},{'id':'21','name':'same'}],True)
         self.assertEqual(self.put(['22'])['fan_count'],3)
@@ -58,6 +70,16 @@ class FanTests(unittest.TestCase):
         self.assertEqual(users['22']['monthly'],[])
         self.assertEqual(self.db.read_bytes(),before)
         self.assertEqual(webdata.fan_destinations(self.db,'999')['owner'],None)
+
+    def test_activity_sort_uses_latest_observation_and_nulls_last(self):
+        self.put(['20','21','22'],True)
+        now=datetime.now(timezone.utc)
+        for minute,listener in [(90,'20'),(60,'21'),(5,'20')]:
+            save_snapshot(self.db,{'room_id':str(minute),'broadcaster':{'id':'10','name':'own'},
+                'listeners':[{'id':listener,'name':listener}],'complete':True,
+                'observed_at':(now-timedelta(minutes=minute)).isoformat()})
+        self.assertEqual([u['id'] for u in webdata.fan_destinations(self.db,'10',sort='activity')['fans']],['20','21','22'])
+        self.assertEqual([u['id'] for u in webdata.fan_destinations(self.db,'10',sort='oldest')['fans']],['21','20','22'])
 
     def test_recent_fans_are_sorted_before_pagination(self):
         self.put([str(i) for i in range(100,155)],True)

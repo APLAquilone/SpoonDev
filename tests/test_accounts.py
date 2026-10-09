@@ -11,8 +11,8 @@ class AccountTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(); root=Path(self.temp.name)
         self.database=root/'shared.sqlite3'; self.auth=root/'accounts.sqlite3'
         db.initialize(self.database)
-        self.uid=accounts.create(self.auth,'alice','example-password-123')
-        accounts.create(self.auth,'bob','other-password-123')
+        self.uid=accounts.create(self.auth,'alice','example-password-123',must_change=False)
+        accounts.create(self.auth,'bob','other-password-123',must_change=False)
         self.server=web.make_server(self.database,port=0,auth=True,auth_database=self.auth)
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
         self.origin='http://127.0.0.1:'+str(self.server.server_port)
@@ -81,7 +81,7 @@ class AccountTests(unittest.TestCase):
         fans.initialize(self.database)
         fans.import_followers(self.database,{'owner':{'id':'316644201','name':'legacy'},'followers':[],'complete':False})
         with self.assertRaises(ValueError): accounts.claim(self.auth,self.uid,self.database)
-        admin=accounts.create(self.auth,'kitomoya','admin-password-123')
+        admin=accounts.create(self.auth,'kitomoya','admin-password-123',must_change=False)
         accounts.claim(self.auth,admin,self.database)
         alice,_=self.login('alice','example-password-123')
         kitomoya,csrf=self.login('kitomoya','admin-password-123')
@@ -91,7 +91,7 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(self.request('/api/fan-owners',cookie=kitomoya)[2],[])
 
     def test_stats_only_kitomoya(self):
-        accounts.create(self.auth,'kitomoya','admin-password-123')
+        accounts.create(self.auth,'kitomoya','admin-password-123',must_change=False)
         admin,_=self.login('kitomoya','admin-password-123')
         alice,csrf=self.login('alice','example-password-123')
         self.assertEqual(self.request('/api/stats',cookie=admin)[0],200)
@@ -105,6 +105,58 @@ class AccountTests(unittest.TestCase):
         self.assertNotIn('id="stats" hidden',self.request('/',cookie=admin)[2])
         # Ordinary users retain their own favorite and fan configuration.
         self.assertEqual(self.request('/api/favorites',{'users':[],'revision':0},alice,csrf)[0],200)
+
+    def test_first_login_requires_password_change_and_revokes_sessions(self):
+        accounts.create(self.auth,'firstuser','initial-password-123')
+        cookie,csrf=self.login('firstuser','initial-password-123')
+        self.assertEqual(self.request('/',cookie=cookie)[1]['Location'],'/password')
+        self.assertEqual(self.request('/api/favorites',cookie=cookie)[0],403)
+        self.assertEqual(self.request('/password',cookie=cookie)[0],200)
+        payload={'current_password':'initial-password-123','new_password':'personal-password-456'}
+        self.assertEqual(self.request('/api/password',payload,cookie)[0],403)
+        self.assertEqual(self.request('/api/password',{**payload,'current_password':'wrong-password-123'},cookie,csrf)[0],400)
+        self.assertEqual(self.request('/api/password',{**payload,'new_password':'initial-password-123'},cookie,csrf)[0],400)
+        self.assertEqual(self.request('/api/password',payload,cookie,csrf)[0],200)
+        self.assertEqual(self.request('/api/favorites',cookie=cookie)[0],401)
+        new,_=self.login('firstuser','personal-password-456')
+        self.assertEqual(self.request('/api/favorites',cookie=new)[0],200)
+
+    def test_admin_account_management_and_authorization(self):
+        accounts.create(self.auth,'kitomoya','admin-password-123',must_change=False)
+        admin,csrf=self.login('kitomoya','admin-password-123')
+        user,uc=self.login('alice','example-password-123')
+        self.assertEqual(self.request('/api/admin/users',cookie=user)[0],403)
+        create={'username':'createduser','password':'initial-password-123','label':'プラン1'}
+        self.assertEqual(self.request('/api/admin/users/create',create,user,uc)[0],403)
+        self.assertEqual(self.request('/api/admin/users/create',create,admin)[0],403)
+        result=self.request('/api/admin/users/create',create,admin,csrf)
+        self.assertEqual(result[0],200);uid=result[2]['id']
+        listing=self.request('/api/admin/users',cookie=admin)[2]
+        record=next(u for u in listing if u['id']==uid)
+        self.assertEqual((record['role'],record['label'],record['must_change']),('user','プラン1',1))
+        self.assertNotIn('password',record);self.assertNotIn('salt',record)
+        self.assertEqual(next(u for u in listing if u['username']=='alice')['label'],'保守')
+        self.assertEqual(self.request('/api/admin/users/label',{'id':uid,'label':'プラン3'},admin,csrf)[0],200)
+        created,_=self.login('createduser','initial-password-123')
+        self.assertEqual(self.request('/api/admin/users/delete',{'id':uid,'confirm':True},admin,csrf)[0],200)
+        self.assertEqual(self.request('/password',cookie=created)[0],401)
+        aid=next(u for u in listing if u['username']=='kitomoya')['id']
+        self.assertEqual(self.request('/api/admin/users/delete',{'id':aid,'confirm':True},admin,csrf)[0],400)
+        # A replacement ID creates a fresh private namespace.
+        replacement=self.request('/api/admin/users/create',create,admin,csrf)[2]['id']
+        self.assertNotEqual(uid,replacement)
+
+    def test_legacy_migration_labels_and_roles(self):
+        import sqlite3
+        legacy=Path(self.temp.name)/'legacy.sqlite3'
+        with sqlite3.connect(legacy) as c:
+            c.execute('CREATE TABLE accounts(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,salt TEXT NOT NULL,password TEXT NOT NULL)')
+            c.execute('INSERT INTO accounts VALUES(?,?,?,?)',('a'*32,'kitomoya','00'*16,'hash'))
+        accounts.initialize(legacy);accounts.initialize(legacy)
+        row=accounts.list_users(legacy)[0]
+        self.assertEqual((row['label'],row['role'],row['must_change']),('保守','admin',1))
+        accounts.set_label(legacy,row['id'],'プラン2');accounts.initialize(legacy)
+        self.assertEqual(accounts.list_users(legacy)[0]['label'],'プラン2')
 
     def test_wrong_password_and_public_validation(self):
         self.assertEqual(self.request('/api/login',{'username':'alice','password':'wrong-password-123'})[0],401)

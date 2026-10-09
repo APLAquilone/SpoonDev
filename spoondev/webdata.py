@@ -138,12 +138,17 @@ def fan_owners(database, private_database=None):
             FROM fan_owners o ORDER BY imported_at DESC,id''')]
 
 
-def fan_destinations(database, owner_id, offset=0, limit=50, private_database=None):
+def fan_destinations(database, owner_id, offset=0, limit=50, private_database=None, sort="recent"):
     """Join an owner's imported fans with current-month rankings and recent live sightings."""
     from .fans import numeric_id
     owner_id=numeric_id(owner_id)
     if type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=50:
         raise ValueError('Invalid pagination')
+    orders={'recent':"recent DESC,CASE WHEN a.last_live_at>=? THEN a.last_live_at END DESC,f.user_id",
+            'activity':"a.last_live_at DESC,f.user_id",'oldest':"a.last_live_at IS NULL,a.last_live_at ASC,f.user_id",
+            'name':"name COLLATE NOCASE ASC,f.user_id",'name_desc':"name COLLATE NOCASE DESC,f.user_id",
+            'id':"LENGTH(f.user_id),f.user_id"}
+    if sort not in orders: raise ValueError('Invalid sort')
     now=datetime.now(timezone.utc)
     month=now.astimezone(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m')
     cutoff=(now-timedelta(minutes=30)).isoformat(timespec='microseconds')
@@ -160,9 +165,8 @@ def fan_destinations(database, owner_id, offset=0, limit=50, private_database=No
           COALESCE(p.tag,f.tag) AS tag,a.last_live_at,
           COALESCE(a.last_live_at>=?,0) AS recent FROM registered_fans f
           LEFT JOIN profiles p ON p.id=f.user_id LEFT JOIN activity a ON a.listener_id=f.user_id
-          WHERE f.owner_id=? ORDER BY recent DESC,
-          CASE WHEN a.last_live_at>=? THEN a.last_live_at END DESC,f.user_id LIMIT ? OFFSET ?''',
-          (owner_id,now.isoformat(timespec='microseconds'),cutoff,owner_id,cutoff,limit+1,offset)).fetchall()
+          WHERE f.owner_id=? ORDER BY {orders[sort]} LIMIT ? OFFSET ?''',
+          (owner_id,now.isoformat(timespec='microseconds'),cutoff,owner_id,*([cutoff] if sort=='recent' else []),limit+1,offset)).fetchall()
         users=[dict(row,monthly=[],live=[]) for row in rows[:limit]]
         indexed=conn.execute('SELECT COUNT(DISTINCT dj_id),MAX(observed_at) FROM monthly_dj_snapshots WHERE month=?',(month,)).fetchone()
         if users:

@@ -17,6 +17,10 @@ def initialize(path):
     with sqlite3.connect(path) as c:
         c.executescript('''CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,salt TEXT NOT NULL,password TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,account_id TEXT NOT NULL,csrf TEXT NOT NULL,expires REAL NOT NULL);''')
+        columns={r[1] for r in c.execute('PRAGMA table_info(accounts)')}
+        for name,definition in [('label',"TEXT NOT NULL DEFAULT '保守'"),('must_change','INTEGER NOT NULL DEFAULT 1'),('role',"TEXT NOT NULL DEFAULT 'user'")]:
+            if name not in columns: c.execute(f'ALTER TABLE accounts ADD COLUMN {name} {definition}')
+        c.execute("UPDATE accounts SET role=CASE WHEN username='kitomoya' THEN 'admin' ELSE 'user' END")
     path.chmod(0o600)
 
 
@@ -27,7 +31,9 @@ def password_hash(password,salt):
         return hashlib.scrypt(password.encode(),salt=bytes.fromhex(salt),n=32768,r=8,p=1,maxmem=64*1024*1024).hex()
 
 
-def create(path,username,password,reset=False):
+def create(path,username,password,reset=False, *, label="保守", must_change=True):
+    label=validate_label(label)
+    if not isinstance(username,str): raise ValueError("ユーザーIDを指定してください。")
     username=username.strip().lower()
     if not re.fullmatch(r'[a-z0-9_-]{3,64}',username):
         raise ValueError('ユーザー名は英小文字・数字・_- の3〜64文字です。')
@@ -36,12 +42,12 @@ def create(path,username,password,reset=False):
         old=c.execute('SELECT id FROM accounts WHERE username=?',(username,)).fetchone()
         if reset:
             if not old: raise ValueError('ユーザーが存在しません。')
-            uid=old[0]; c.execute('UPDATE accounts SET salt=?,password=? WHERE id=?',(salt,hashed,uid))
+            uid=old[0]; c.execute('UPDATE accounts SET salt=?,password=?,must_change=? WHERE id=?',(salt,hashed,int(must_change),uid))
             c.execute('DELETE FROM sessions WHERE account_id=?',(uid,))
         else:
             if old: raise ValueError('ユーザー名は登録済みです。')
             uid=secrets.token_hex(16)
-            c.execute('INSERT INTO accounts VALUES(?,?,?,?)',(uid,username,salt,hashed))
+            c.execute('INSERT INTO accounts(id,username,salt,password,label,must_change,role) VALUES(?,?,?,?,?,?,?)',(uid,username,salt,hashed,label,int(must_change),'admin' if username=='kitomoya' else 'user'))
     private(path,uid)
     return uid
 
@@ -75,7 +81,7 @@ def login(path,username,password):
 def session(path,token):
     with sqlite3.connect(path) as c:
         c.row_factory=sqlite3.Row
-        row=c.execute('SELECT a.id,a.username,s.csrf FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE token=? AND expires>?',(hashlib.sha256(token.encode()).hexdigest(),time.time())).fetchone()
+        row=c.execute('SELECT a.id,a.username,a.label,a.role,a.must_change,s.csrf FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE token=? AND expires>?',(hashlib.sha256(token.encode()).hexdigest(),time.time())).fetchone()
         return dict(row) if row else None
 
 
@@ -110,3 +116,45 @@ def claim(path,uid,source):
         for oid,name,tag,complete in owners:
             followers=[{'id':i,'name':n,'tag':t} for i,n,t in c.execute('SELECT user_id,name,tag FROM registered_fans WHERE owner_id=?',(oid,))]
             fans.import_followers(target,{'owner':{'id':oid,'name':name,'tag':tag},'followers':followers,'complete':bool(complete)})
+
+
+def validate_label(label):
+    if not isinstance(label,str) or not 1<=len(label.strip())<=64 or any(ord(ch)<32 for ch in label):
+        raise ValueError('ラベルは1〜64文字で指定してください。')
+    return label.strip()
+
+
+def list_users(path):
+    with sqlite3.connect(path) as c:
+        c.row_factory=sqlite3.Row
+        return [dict(r) for r in c.execute('SELECT id,username,label,role,must_change FROM accounts ORDER BY username')]
+
+
+def set_label(path,uid,label):
+    label=validate_label(label)
+    with sqlite3.connect(path) as c:
+        if c.execute('UPDATE accounts SET label=? WHERE id=?',(label,uid)).rowcount!=1: raise ValueError('ユーザーが存在しません。')
+    return {'ok':True}
+
+
+def delete_user(path,uid):
+    with sqlite3.connect(path) as c:
+        row=c.execute('SELECT username FROM accounts WHERE id=?',(uid,)).fetchone()
+        if not row: raise ValueError('ユーザーが存在しません。')
+        if row[0]=='kitomoya': raise ValueError('管理者アカウントは削除できません。')
+        c.execute('DELETE FROM sessions WHERE account_id=?',(uid,))
+        c.execute('DELETE FROM accounts WHERE id=?',(uid,))
+    # Inaccessible account files are retained for operator backup/recovery.
+    return {'ok':True}
+
+
+def change_password(path,uid,current,new):
+    with sqlite3.connect(path) as c:
+        row=c.execute('SELECT salt,password FROM accounts WHERE id=?',(uid,)).fetchone()
+        if not row or not hmac.compare_digest(password_hash(current,row[0]),row[1]):
+            raise ValueError('現在のパスワードを確認してください。')
+        if current==new: raise ValueError('初期パスワードとは異なるパスワードを設定してください。')
+        salt=secrets.token_hex(16);hashed=password_hash(new,salt)
+        c.execute('UPDATE accounts SET salt=?,password=?,must_change=0 WHERE id=?',(salt,hashed,uid))
+        c.execute('DELETE FROM sessions WHERE account_id=?',(uid,))
+    return {'ok':True}
