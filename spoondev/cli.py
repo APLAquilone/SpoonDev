@@ -26,6 +26,10 @@ def main(argv=None):
     account.add_argument('--reset',action='store_true')
     account.add_argument('--label',default='保守')
     account.add_argument('--claim-local-data',action='store_true')
+    role=commands.add_parser('set-role',help='Grant/revoke console administrator rights')
+    role.add_argument('username')
+    role.add_argument('role',choices=['admin','user'])
+    role.add_argument('--auth-db',default='data/accounts.sqlite3')
     imp = commands.add_parser("import")
     imp.add_argument("file", type=Path)
     report = commands.add_parser("report")
@@ -61,6 +65,10 @@ def main(argv=None):
     if args.command == 'collect-monthly' and (args.max_djs < 0 or args.max_pages < 0):
         parser.error('max-djs and max-pages must be nonnegative')
     try:
+        if args.command == 'set-role':
+            from . import accounts
+            print(json.dumps(accounts.set_role(args.auth_db,args.username,args.role),ensure_ascii=False))
+            return 0
         if args.command == 'create-user':
             import getpass
             from . import accounts

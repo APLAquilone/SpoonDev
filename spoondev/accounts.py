@@ -20,7 +20,7 @@ def initialize(path):
         columns={r[1] for r in c.execute('PRAGMA table_info(accounts)')}
         for name,definition in [('label',"TEXT NOT NULL DEFAULT '保守'"),('must_change','INTEGER NOT NULL DEFAULT 1'),('role',"TEXT NOT NULL DEFAULT 'user'")]:
             if name not in columns: c.execute(f'ALTER TABLE accounts ADD COLUMN {name} {definition}')
-        c.execute("UPDATE accounts SET role=CASE WHEN username='kitomoya' THEN 'admin' ELSE 'user' END")
+        c.execute("UPDATE accounts SET role='admin' WHERE username='kitomoya'")
     path.chmod(0o600)
 
 
@@ -158,3 +158,16 @@ def change_password(path,uid,current,new):
         c.execute('UPDATE accounts SET salt=?,password=?,must_change=0 WHERE id=?',(salt,hashed,uid))
         c.execute('DELETE FROM sessions WHERE account_id=?',(uid,))
     return {'ok':True}
+
+
+def set_role(path,username,role):
+    if role not in ('admin','user') or not isinstance(username,str):
+        raise ValueError('権限は admin または user を指定してください。')
+    initialize(path)
+    with sqlite3.connect(path) as c:
+        row=c.execute('SELECT id,username FROM accounts WHERE username=?',(username.strip().lower(),)).fetchone()
+        if not row: raise ValueError('ユーザーが存在しません。')
+        if row[1]=='kitomoya' and role!='admin': raise ValueError('kitomoya の管理者権限は解除できません。')
+        c.execute('UPDATE accounts SET role=? WHERE id=?',(role,row[0]))
+        c.execute('DELETE FROM sessions WHERE account_id=?',(row[0],))
+    return {'username':row[1],'role':role}

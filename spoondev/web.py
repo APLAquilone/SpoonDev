@@ -114,14 +114,14 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 if route.path == '/':
                     html=Path(__file__).with_name('static').joinpath('index.html').read_text()
                     if auth:
-                        self.user['can_view_stats']=self.user['role']=='admin'
+                        self.user['can_view_stats']=self.user['username']=='kitomoya'
                         if not self.user['can_view_stats']:
                             html=html.replace('id="stats"','id="stats" hidden')
                         bootstrap=json.dumps(self.user).replace('<','\\u003c')
                         html=html.replace('<script>','<script>window.spoondevAccount='+bootstrap+';</script><script>',1)
                     self.respond(200,html.encode(),'text/html; charset=utf-8')
                 elif route.path == '/api/stats':
-                    if auth and self.user['role']!='admin':
+                    if auth and self.user['username']!='kitomoya':
                         self.respond(403,{'error':'集計情報は管理者のみ閲覧できます。'})
                     else:
                         self.respond(200, webdata.stats(database))
@@ -191,7 +191,7 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
 
         def do_POST(self):
             path=urlsplit(self.path).path
-            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites','/api/password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
+            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites','/api/password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/role','/api/admin/users/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
                 self.respond(405,{'error':'この操作は利用できません。'}); return
             if path!='/api/login' and not self.gate(): return
             origin=self.headers.get('Origin')
@@ -234,6 +234,9 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 if path=='/api/admin/users/create':
                     uid=accounts.create(auth_database,payload.get('username'),payload.get('password'),label=payload.get('label','保守'))
                     result={'id':uid}
+                elif path=='/api/admin/users/role':
+                    if payload.get('username')==self.user['username']: raise ValueError('自分の権限はこの画面から変更できません。')
+                    result=accounts.set_role(auth_database,payload.get('username'),payload.get('role'))
                 elif path=='/api/admin/users/label':
                     result=accounts.set_label(auth_database,payload.get('id'),payload.get('label'))
                 elif path=='/api/admin/users/delete':

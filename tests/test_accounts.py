@@ -158,6 +158,27 @@ class AccountTests(unittest.TestCase):
         accounts.set_label(legacy,row['id'],'プラン2');accounts.initialize(legacy)
         self.assertEqual(accounts.list_users(legacy)[0]['label'],'プラン2')
 
+    def test_explicit_role_assignment_persists_and_revokes_sessions(self):
+        admin=accounts.create(self.auth,'kitomoya','admin-password-123',must_change=False)
+        root,rc=self.login('kitomoya','admin-password-123')
+        alice,ac=self.login('alice','example-password-123')
+        action={'username':'bob','role':'admin'}
+        self.assertEqual(self.request('/api/admin/users/role',action,alice,ac)[0],403)
+        accounts.set_label(self.auth,self.uid,'管理者')
+        self.assertEqual(self.request('/api/admin/users',cookie=alice)[0],403)
+        self.assertEqual(self.request('/api/admin/users/role',{'username':'alice','role':'admin'},root,rc)[0],200)
+        self.assertEqual(self.request('/api/admin/users',cookie=alice)[0],401)
+        accounts.initialize(self.auth)
+        promoted,pc=self.login('alice','example-password-123')
+        self.assertEqual(self.request('/api/admin/users',cookie=promoted)[0],200)
+        self.assertEqual(self.request('/api/stats',cookie=promoted)[0],403)
+        self.assertEqual(self.request('/api/admin/users/role',{'username':'alice','role':'user'},promoted,pc)[0],400)
+        self.assertEqual(self.request('/api/admin/users/role',{'username':'kitomoya','role':'user'},promoted,pc)[0],400)
+        self.assertEqual(self.request('/api/admin/users/role',{'username':'alice','role':'user'},root,rc)[0],200)
+        self.assertEqual(self.request('/api/admin/users',cookie=promoted)[0],401)
+        demoted,_=self.login('alice','example-password-123')
+        self.assertEqual(self.request('/api/admin/users',cookie=demoted)[0],403)
+
     def test_wrong_password_and_public_validation(self):
         self.assertEqual(self.request('/api/login',{'username':'alice','password':'wrong-password-123'})[0],401)
         for _ in range(10): self.request('/api/login',{'username':'alice','password':'wrong-password-123'})
