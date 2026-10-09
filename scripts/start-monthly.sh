@@ -5,7 +5,7 @@ mkdir -p data
 chmod 700 data
 nohup flock --nonblock --no-fork data/monthly.lock \
   python -u -m spoondev --db data/spoondev.sqlite3 collect-monthly \
-    --max-djs 0 --max-pages 100 --interval 3600 --concurrency 4 \
+    --max-djs 0 --max-pages 0 --interval 3600 --concurrency 4 \
     >> data/monthly.log 2>&1 < /dev/null &
 monthly_pid=$!
 printf '%s\n' "$monthly_pid" > data/monthly.last-start.pid

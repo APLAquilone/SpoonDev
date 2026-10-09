@@ -97,4 +97,24 @@ class MonthlyTests(unittest.TestCase):
         self.assertEqual(fetch.call_count,1); self.assertFalse(summary['complete'])
         self.assertIn('origin',summary['errors'][0])
 
+    def test_default_follows_beyond_old_page_cap(self):
+        from urllib.parse import urlsplit,parse_qs
+        def fetch(url):
+            page=int(parse_qs(urlsplit(url).query).get('cursor',['0'])[0])
+            return {'results':[{'user':{'id':1000+page,'nickname':'listener'},'favoriteTemperature':1}],
+                    'next':str(page+1) if page<104 else None}
+        with patch('spoondev.monthly.fetch_snapshot',side_effect=fetch) as mock,patch('spoondev.monthly.time.sleep'):
+            summary=collect_monthly(self.path,max_djs=0)
+        self.assertEqual(mock.call_count,210)
+        self.assertTrue(summary['complete'])
+        self.assertEqual(summary['user_count'],105)
+
+    def test_optional_cap_and_cycle_still_stop(self):
+        page=dict(self.page,next='repeat')
+        with patch('spoondev.monthly.fetch_snapshot',return_value=page),patch('spoondev.monthly.time.sleep'):
+            capped=collect_monthly(self.path,max_djs=1,max_pages=1)
+            cyclic=collect_monthly(self.path,max_djs=1,max_pages=0)
+        self.assertIn('page cap',capped['errors'][0])
+        self.assertIn('pagination loop',cyclic['errors'][0])
+
 if __name__=='__main__': unittest.main()

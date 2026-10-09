@@ -38,7 +38,7 @@ def main(argv=None):
     spoon.add_argument("--once", action="store_true")
     monthly = commands.add_parser('collect-monthly', help='Index current-month public DJ rankings as listener appearances')
     monthly.add_argument('--max-djs',type=int,default=100,help='0 scans all known broadcasters')
-    monthly.add_argument('--max-pages',type=int,default=100)
+    monthly.add_argument('--max-pages',type=int,default=0,help='0 follows all pages (default); positive value sets an optional cap')
     monthly.add_argument('--concurrency',type=int,default=4)
     monthly.add_argument('--interval',type=float,default=3600)
     monthly.add_argument('--once',action='store_true')
@@ -49,8 +49,8 @@ def main(argv=None):
         parser.error("concurrency must be 1..16; interval must be at least 30 seconds")
     if args.command == "collect-spoon" and (args.max_rooms < 0 or args.max_pages < 1):
         parser.error("max-rooms must be nonnegative; max-pages must be positive")
-    if args.command == 'collect-monthly' and (args.max_djs < 0 or args.max_pages < 1):
-        parser.error('max-djs must be nonnegative; max-pages must be positive')
+    if args.command == 'collect-monthly' and (args.max_djs < 0 or args.max_pages < 0):
+        parser.error('max-djs and max-pages must be nonnegative')
     try:
         if args.command == 'serve':
             from .web import serve

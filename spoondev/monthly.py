@@ -4,6 +4,7 @@ Coverage is limited to broadcasters known from live observations. A ranking
 entry is a monthly profile relationship, never proof of a current live visit.
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import count
 from datetime import datetime, timezone
 from pathlib import Path
 import math
@@ -38,8 +39,8 @@ def _entry(row):
     return user,temperature
 
 
-def collect_monthly(database,max_djs=100,concurrency=4,max_pages=100,progress_callback=None,stopped_event=None):
-    if type(max_djs) is not int or max_djs<0 or type(concurrency) is not int or concurrency<1 or type(max_pages) is not int or max_pages<1:
+def collect_monthly(database,max_djs=100,concurrency=4,max_pages=0,progress_callback=None,stopped_event=None):
+    if type(max_djs) is not int or max_djs<0 or type(concurrency) is not int or concurrency<1 or type(max_pages) is not int or max_pages<0:
         raise ValueError('invalid collection limits')
     with sqlite3.connect(Path(database).resolve().as_uri()+'?mode=ro',uri=True) as conn:
         rows=conn.execute('''WITH known AS (SELECT broadcaster_id,MAX(observed_at) AS recent
@@ -79,7 +80,7 @@ def collect_monthly(database,max_djs=100,concurrency=4,max_pages=100,progress_ca
         url=endpoint+'?rankType=MONTHLY'
         seen_urls=set(); entries={}; successful=False
         try:
-            for page_number in range(max_pages):
+            for page_number in (range(max_pages) if max_pages else count()):
                 if url in seen_urls: raise ValueError('pagination loop')
                 seen_urls.add(url)
                 payload=request(url)
