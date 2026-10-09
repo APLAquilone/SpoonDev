@@ -21,8 +21,15 @@ CREATE TABLE IF NOT EXISTS user_attributes (
  user_id TEXT NOT NULL REFERENCES users(id), tag TEXT, favorite_temperature REAL,
  PRIMARY KEY(snapshot_id,user_id));
 CREATE INDEX IF NOT EXISTS snapshots_broadcaster ON snapshots(broadcaster_id,observed_at);
+CREATE INDEX IF NOT EXISTS snapshots_room ON snapshots(broadcaster_id,room_id,observed_at);
 CREATE INDEX IF NOT EXISTS memberships_listener ON memberships(listener_id,snapshot_id);
 CREATE INDEX IF NOT EXISTS user_attributes_user ON user_attributes(user_id,snapshot_id);
+CREATE TABLE IF NOT EXISTS observation_attempts (
+ id INTEGER PRIMARY KEY, collection_run_id INTEGER, room_id TEXT NOT NULL,
+ broadcaster_id TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL,
+ page_count INTEGER NOT NULL CHECK(page_count>=0), state TEXT NOT NULL,
+ snapshot_id INTEGER UNIQUE REFERENCES snapshots(id) ON DELETE SET NULL);
+CREATE INDEX IF NOT EXISTS observation_attempts_room ON observation_attempts(room_id,finished_at);
 """
 
 @contextmanager
@@ -101,7 +108,35 @@ def _validate(payload):
     return stamp, broadcaster, listeners, names, attributes
 
 
-def save_snapshot(database, payload):
+def record_room_attempt(database, metadata, *, snapshot_id=None, collection_run_id=None):
+    """Store actual fetch boundaries, including failed rooms with no snapshot."""
+    required = {'room_id', 'broadcaster_id', 'started_at', 'finished_at', 'page_count', 'state'}
+    if not isinstance(metadata, dict) or not required <= metadata.keys():
+        raise ValueError('room attempt requires fetch boundaries and state')
+    if (type(metadata['page_count']) is not int or metadata['page_count'] < 0 or
+            metadata['state'] not in ('completed', 'partial', 'failed')):
+        raise ValueError('invalid room attempt state or page count')
+    boundaries = []
+    for key in ('started_at', 'finished_at'):
+        stamp = datetime.fromisoformat(metadata[key].replace('Z', '+00:00'))
+        if stamp.tzinfo is None:
+            raise ValueError('room fetch boundaries require timezones')
+        boundaries.append(stamp.astimezone(timezone.utc).isoformat(timespec='microseconds'))
+    if boundaries[1] < boundaries[0]:
+        raise ValueError('room fetch ended before it started')
+    for key in ('room_id', 'broadcaster_id'):
+        if not isinstance(metadata[key], str) or not metadata[key]:
+            raise ValueError('room attempt requires room and broadcaster IDs')
+    with _connection(database) as conn:
+        conn.execute('''INSERT INTO observation_attempts(collection_run_id,room_id,broadcaster_id,
+            started_at,finished_at,page_count,state,snapshot_id) VALUES(?,?,?,?,?,?,?,?)''',
+            (collection_run_id, metadata['room_id'], metadata['broadcaster_id'],
+             *boundaries, metadata['page_count'], metadata['state'], snapshot_id))
+        if not isinstance(database, sqlite3.Connection):
+            conn.commit()
+
+
+def save_snapshot(database, payload, *, metadata=None, collection_run_id=None):
     """Store one validated observation atomically; returns its snapshot ID."""
     stamp, broadcaster, listeners, names, attributes = _validate(payload)
     with _connection(database) as conn:
@@ -118,6 +153,10 @@ def save_snapshot(database, payload):
             conn.executemany('INSERT INTO names VALUES (?,?,?)', [(snapshot_id,u,n) for u,n in names.items()])
             conn.executemany('INSERT INTO user_attributes VALUES (?,?,?,?)', [(snapshot_id,u,*a) for u,a in attributes.items()])
             conn.executemany('INSERT INTO memberships VALUES (?,?)', [(snapshot_id,u) for u in listeners])
+            if metadata is not None:
+                if metadata.get('room_id') != payload['room_id'] or metadata.get('broadcaster_id') != broadcaster[0]:
+                    raise ValueError('room fetch metadata does not match the snapshot')
+                record_room_attempt(conn, metadata, snapshot_id=snapshot_id, collection_run_id=collection_run_id)
             conn.execute('RELEASE SAVEPOINT snapshot_write')
         except BaseException:
             conn.execute('ROLLBACK TO SAVEPOINT snapshot_write')

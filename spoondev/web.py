@@ -45,6 +45,8 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
         raise FileNotFoundError('Database not found; run init-db or collect-spoon first')
     profiledb.initialize(database)
     fans.initialize(database)
+    from . import worker
+    worker.initialize(database)
 
     class Handler(BaseHTTPRequestHandler):
         def respond(self, status, body, content_type='application/json; charset=utf-8', headers=None):
@@ -79,6 +81,48 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
             self.private_db=accounts.private(auth_database,self.user['id']) if self.user else None
             return self.user
 
+        def own_profile(self):
+            return accounts.account_settings(self.private_db)['spoon_profile'] if auth else None
+
+        def fan_scope(self, owner_id):
+            if auth and self.user['role'] != 'admin':
+                profile = self.own_profile()
+                if not profile or profile['id'] != owner_id:
+                    raise PermissionError('ファン一覧は登録したご自身の配信者に限り操作できます。')
+
+        def resolve_profile(self, raw):
+            import re
+            if not isinstance(raw, str):
+                raise ValueError('プロフィールURLまたは数値IDを指定してください。')
+            raw = raw.strip()
+            if raw.startswith('https://'):
+                parts = urlsplit(raw)
+                match = re.fullmatch(r'/jp/channel/([0-9]{1,20})(?:/tab/[a-z]+)?/?', parts.path)
+                if (parts.hostname not in ('www.spooncast.net', 'spooncast.net') or
+                        parts.username or parts.port or parts.fragment or not match):
+                    raise ValueError('SpoonのプロフィールURLを指定してください。')
+                raw = match.group(1)
+            uid = fans.numeric_id(raw)
+            profile = webdata.user_details(database, uid)
+            if profile is None:
+                from .directory import resolve_user
+                profile = resolve_user(uid)
+            if not profile or str(profile.get('id')) != uid:
+                raise ValueError('プロフィールの数値IDを確認できませんでした。')
+            return {key: profile.get(key) for key in ('id', 'name', 'tag')}
+
+        def enrich(self, users):
+            from .insights import listener_insights
+            profile = self.own_profile()
+            ids = list(dict.fromkeys(str(u.get('id') or u.get('user_id')) for u in users))
+            metrics = {}
+            for start in range(0, len(ids), 100):
+                metrics.update(listener_insights(database, ids[start:start+100],
+                    broadcaster_id=profile['id'] if profile else None))
+            for user in users:
+                uid = str(user.get('id') or user.get('user_id'))
+                user['insights'] = metrics.get(uid)
+
         def gate(self):
             if not auth: return True
             if public_url and self.headers.get('Host')!=urlsplit(public_url).netloc:
@@ -96,6 +140,7 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
 
         def do_GET(self):
             try:self._get()
+            except PermissionError as exc:self.respond(403,{'error':str(exc)})
             except (sqlite3.Error,OSError):self.respond(503,{'error':'データを読み込めませんでした。時間をおいて再試行してください。'})
             except ValueError:self.respond(400,{'error':'リクエストを確認してください。'})
 
@@ -113,12 +158,29 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 with webdata._read(database) as conn:result=read(conn)
                 self.respond(200,result);return
             if auth and path=='/api/account/settings':
-                self.respond(200,accounts.account_settings(self.private_db));return
+                result=accounts.account_settings(self.private_db)
+                result['can_change']=self.user['role']=='admin' or not result['spoon_profile']
+                self.respond(200,result);return
+            if auth and path=='/api/account/profile-preview':
+                query=parse_qs(urlsplit(self.path).query,max_num_fields=3)
+                from .directory import DirectoryError
+                try: result=self.resolve_profile(query.get('spoon_id',[''])[0])
+                except DirectoryError:
+                    self.respond(502,{'error':'プロフィールを確認できませんでした。時間をおいて再試行してください。'});return
+                self.respond(200,result);return
             if auth and path=='/api/dashboard':
                 from .dashboard import summary
                 self.respond(200,summary(database,self.private_db));return
             if auth and path=='/api/admin/users':
-                self.respond(200,accounts.list_users(auth_database));return
+                result=accounts.list_users(auth_database)
+                for user in result:
+                    setting=accounts.account_settings(accounts.private(auth_database,user['id']))
+                    user['spoon_profile']=setting['spoon_profile']
+                    user['binding_locked']=setting['binding_locked']
+                self.respond(200,result);return
+            if auth and path=='/api/admin/labels':
+                rows=accounts.list_labels(auth_database)
+                self.respond(200,{'labels':[row['name'] for row in rows],'items':rows});return
             if auth and path=='/api/favorites':
                 self.respond(200,accounts.favorites(self.private_db)); return
             if len(self.path) > 4096:
@@ -150,9 +212,14 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                     except LiveStatusError as exc:
                         self.respond(503, {'error':str(exc)})
                 elif route.path == '/api/fan-owners':
-                    self.respond(200, webdata.fan_owners(database, self.private_db if auth else None))
+                    result=webdata.fan_owners(database, self.private_db if auth else None)
+                    if auth and self.user['role']!='admin':
+                        own=self.own_profile()
+                        result=[row for row in result if own and row['id']==own['id']]
+                    self.respond(200,result)
                 elif route.path == '/api/fans':
                     owner_id = fans.numeric_id(query.get('owner_id', [''])[0])
+                    self.fan_scope(owner_id)
                     offset = int(query.get('offset', ['0'])[0])
                     if not 0 <= offset <= 1000000:
                         raise ValueError('Invalid offset')
@@ -160,12 +227,15 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                         private_database=self.private_db if auth else None, sort=query.get('sort',['recent'])[0],
                         q=query.get('q',[''])[0], activity=query.get('activity',['all'])[0])
                     if auth and self.user['username']!='kitomoya':result.pop('indexed_djs',None)
+                    self.enrich(result['fans'])
                     self.respond(200,result)
                 elif route.path == '/fan-export.js':
                     self.respond(200, Path(__file__).with_name('static').joinpath('fan-export.js').read_bytes(), 'text/javascript; charset=utf-8')
                 elif route.path == '/api/favorites/activity':
                     ids = query.get('ids', [''])[0]
-                    self.respond(200, webdata.favorite_activity(database, ids.split(',') if ids else []))
+                    result=webdata.favorite_activity(database, ids.split(',') if ids else [])
+                    self.enrich(result['users'])
+                    self.respond(200,result)
                 elif route.path == '/api/users':
                     term = query.get('q',[''])[0].strip()
                     offset = int(query.get('offset',['0'])[0])
@@ -180,9 +250,12 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                             result = webdata.search_users(database,term,limit=50,offset=offset)
                             result['warning'] = str(exc)+' 保存済みデータの検索結果を表示しています。'
                             result['source'] = 'local_fallback'
+                        self.enrich(result['users'])
                         self.respond(200,result)
                     else:
-                        self.respond(200, webdata.search_users(database, term, limit=50, offset=offset))
+                        result=webdata.search_users(database, term, limit=50, offset=offset)
+                        self.enrich(result['users'])
+                        self.respond(200,result)
                 elif route.path.startswith('/api/users/'):
                     user_id = unquote(route.path[len('/api/users/'):])
                     if not user_id or len(user_id) > 200 or '/' in user_id:
@@ -197,7 +270,10 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                         except DirectoryError:
                             self.respond(502,{'error':'Spoonのプロフィールを取得できませんでした。ユーザーが存在しないとは限りません。'})
                             return
-                    self.respond(200,user) if user is not None else self.respond(404,{'error':'ユーザーが見つかりません。'})
+                    if user is not None:
+                        self.enrich([user])
+                        self.respond(200,user)
+                    else:self.respond(404,{'error':'ユーザーが見つかりません。'})
                 elif route.path == '/api/history':
                     broadcaster = query.get('broadcaster_id',[''])[0]
                     listener = query.get('listener_id',[''])[0]
@@ -206,6 +282,8 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                     self.respond(200, webdata.history(database,broadcaster,listener))
                 else:
                     self.respond(404, {'error':'ページが見つかりません。'})
+            except PermissionError as exc:
+                self.respond(403,{'error':str(exc)})
             except ValueError:
                 self.respond(400, {'error':'検索条件を確認してください。'})
             except (sqlite3.Error, OSError):
@@ -213,7 +291,7 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
 
         def do_POST(self):
             path=urlsplit(self.path).path
-            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites','/api/password','/api/account/settings','/api/admin/users/reset-password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/role','/api/admin/users/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
+            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites','/api/password','/api/account/settings','/api/admin/labels','/api/admin/users/spoon-profile','/api/admin/users/reset-password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/role','/api/admin/users/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
                 self.respond(405,{'error':'この操作は利用できません。'}); return
             if path!='/api/login' and not self.gate(): return
             origin=self.headers.get('Origin')
@@ -256,30 +334,40 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 if path=='/api/account/settings':
                     if 'spoon_id' not in payload: raise ValueError('spoon_id を明示してください。解除する場合は null を指定してください。')
                     raw=payload.get('spoon_id')
-                    if raw is None:
-                        result=accounts.account_settings(self.private_db,{'spoon_profile':None})
-                    else:
-                        import re
-                        if not isinstance(raw,str): raise ValueError('プロフィールURLまたは数値IDを指定してください。')
-                        raw=raw.strip()
-                        if raw.startswith('https://'):
-                            parts=urlsplit(raw)
-                            match=re.fullmatch(r'/jp/channel/([0-9]{1,20})(?:/tab/[a-z]+)?/?',parts.path)
-                            if parts.hostname not in ('www.spooncast.net','spooncast.net') or parts.username or not match: raise ValueError('SpoonのプロフィールURLを指定してください。')
-                            raw=match.group(1)
-                        uid=fans.numeric_id(raw)
-                        profile=webdata.user_details(database,uid)
-                        if profile is None:
-                            from .directory import resolve_user, DirectoryError
-                            try: profile=resolve_user(uid)
-                            except DirectoryError:
-                                self.respond(502,{'error':'プロフィールを確認できませんでした。時間をおいて再試行してください。'});return
-                        result=accounts.account_settings(self.private_db,{'spoon_profile':{key:profile.get(key) for key in ('id','name','tag')}})
+                    if self.user['role']!='admin' and self.own_profile():
+                        raise PermissionError('配信者登録は確定済みです。変更は管理者に依頼してください。')
+                    if payload.get('confirmed') is not True:
+                        raise ValueError('配信者の登録内容を確認してください。')
+                    from .directory import DirectoryError
+                    try: profile=self.resolve_profile(raw) if raw is not None else None
+                    except DirectoryError:
+                        self.respond(502,{'error':'プロフィールを確認できませんでした。時間をおいて再試行してください。'});return
+                    result=accounts.account_settings(self.private_db,{'spoon_profile':profile},
+                        allow_change=self.user['role']=='admin',confirmed=True,actor=self.user)
+                    if profile:
+                        profiledb.cache_users(database,[profile])
+                        for kind in ('monthly','gifts'): worker.enqueue(database,kind,profile['id'],priority=100)
+                elif path=='/api/admin/users/spoon-profile':
+                    target=next((u for u in accounts.list_users(auth_database) if u['id']==payload.get('id')),None)
+                    if target is None:raise ValueError('ユーザーが存在しません。')
+                    if 'spoon_id' not in payload or payload.get('confirmed') is not True:
+                        raise ValueError('配信者の変更内容を確認してください。')
+                    from .directory import DirectoryError
+                    try: profile=self.resolve_profile(payload['spoon_id']) if payload['spoon_id'] is not None else None
+                    except DirectoryError:
+                        self.respond(502,{'error':'プロフィールを確認できませんでした。時間をおいて再試行してください。'});return
+                    result=accounts.account_settings(accounts.private(auth_database,target['id']),
+                        {'spoon_profile':profile},allow_change=True,confirmed=True,actor=self.user)
+                    if profile:
+                        profiledb.cache_users(database,[profile])
+                        for kind in ('monthly','gifts'):worker.enqueue(database,kind,profile['id'],priority=100)
+                elif path=='/api/admin/labels':
+                    result=accounts.add_label(auth_database,payload.get('label'))
                 elif path=='/api/admin/users/reset-password':
                     if payload.get('id')==self.user['id']: raise ValueError('自分のパスワードはアカウント設定から変更してください。')
                     result=accounts.reset_password(auth_database,payload.get('id'),payload.get('password'))
                 elif path=='/api/admin/users/create':
-                    uid=accounts.create(auth_database,payload.get('username'),payload.get('password'),label=payload.get('label','保守'))
+                    uid=accounts.create(auth_database,payload.get('username'),payload.get('password'),label=payload.get('label','利用者'))
                     result={'id':uid}
                 elif path=='/api/admin/users/role':
                     if isinstance(payload.get('username'),str) and payload['username'].strip().lower()==self.user['username']: raise ValueError('自分の権限はこの画面から変更できません。')
@@ -294,10 +382,16 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                     if result is None:
                         self.respond(409,{'error':'別の画面で更新されました。再読み込みしてください。'}); return
                 elif path=='/api/fans/clear':
+                    self.fan_scope(fans.numeric_id(payload.get('owner_id')))
                     result=fans.clear_followers(self.private_db if auth else database,payload)
                 else:
+                    self.fan_scope(fans._user(payload.get('owner'),True)['id'])
                     result=fans.import_followers(self.private_db if auth else database,payload)
                 self.respond(200,result)
+            except accounts.BindingConflict as exc:
+                self.respond(409,{'error':str(exc)})
+            except PermissionError as exc:
+                self.respond(403,{'error':str(exc)})
             except (ValueError,UnicodeError) as exc:
                 self.respond(400, {'error':str(exc)})
             except (sqlite3.Error,OSError):

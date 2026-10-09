@@ -33,6 +33,9 @@ class AccountTests(unittest.TestCase):
     def test_isolation_csrf_revision_logout_reset(self):
         self.assertEqual(self.request('/api/stats')[0],401)
         self.assertEqual(self.request('/')[0],303)
+        for user in accounts.list_users(self.auth):
+            accounts.account_settings(accounts.private(self.auth,user['id']),
+                                      {'spoon_profile':{'id':'316644201','name':'Own DJ'}},confirmed=True)
         alice,csrf=self.login('alice','example-password-123');bob,bcsrf=self.login('bob','other-password-123')
         payload={'users':[{'id':'123','name':'private'}],'revision':0}
         self.assertEqual(self.request('/api/favorites',payload,alice)[0],403)
@@ -55,6 +58,7 @@ class AccountTests(unittest.TestCase):
         accounts.create(self.auth,'bob','new-password-123',reset=True)
         self.assertEqual(self.request('/api/favorites',cookie=bob)[0],401)
     def test_clear_fans_is_scoped_and_preserves_other_data(self):
+        accounts.set_role(self.auth,'alice','admin');accounts.set_role(self.auth,'bob','admin')
         alice,csrf=self.login('alice','example-password-123')
         bob,bcsrf=self.login('bob','other-password-123')
         first={'owner':{'id':'10','name':'owner'},'followers':[{'id':'123','name':'fan'}],'complete':True}
@@ -101,11 +105,12 @@ class AccountTests(unittest.TestCase):
         html=self.request('/',cookie=alice)[2]
         self.assertIn('id="stats" hidden',html)
         self.assertIn('"can_view_stats": false',html)
-        self.assertIn('ファン一覧</button>',html)
         self.assertNotIn('id="stats" hidden',self.request('/',cookie=admin)[2])
         # Ordinary users retain their own favorite and fan configuration.
         self.assertEqual(self.request('/api/favorites',{'users':[],'revision':0},alice,csrf)[0],200)
         payload={'owner':{'id':'1','name':'Owner'},'followers':['2'],'complete':True}
+        accounts.account_settings(accounts.private(self.auth,self.uid),
+                                  {'spoon_profile':{'id':'1','name':'Owner'}},confirmed=True)
         for cookie,token in ((alice,csrf),(admin,admin_csrf)):
             self.assertEqual(self.request('/api/fans/import',payload,cookie,token)[0],200)
         self.assertNotIn('indexed_djs',self.request('/api/fans?owner_id=1',cookie=alice)[2])
@@ -128,6 +133,7 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(self.request('/api/favorites',cookie=new)[0],200)
 
     def test_admin_account_management_and_authorization(self):
+        accounts.add_label(self.auth,'プラン1');accounts.add_label(self.auth,'プラン3')
         accounts.create(self.auth,'kitomoya','admin-password-123',must_change=False)
         admin,csrf=self.login('kitomoya','admin-password-123')
         user,uc=self.login('alice','example-password-123')
@@ -141,7 +147,7 @@ class AccountTests(unittest.TestCase):
         record=next(u for u in listing if u['id']==uid)
         self.assertEqual((record['role'],record['label'],record['must_change']),('user','プラン1',1))
         self.assertNotIn('password',record);self.assertNotIn('salt',record)
-        self.assertEqual(next(u for u in listing if u['username']=='alice')['label'],'保守')
+        self.assertEqual(next(u for u in listing if u['username']=='alice')['label'],'利用者')
         self.assertEqual(self.request('/api/admin/users/label',{'id':uid,'label':'プラン3'},admin,csrf)[0],200)
         created,_=self.login('createduser','initial-password-123')
         self.assertEqual(self.request('/api/admin/users/delete',{'id':uid,'confirm':True},admin,csrf)[0],200)
@@ -161,6 +167,7 @@ class AccountTests(unittest.TestCase):
         accounts.initialize(legacy);accounts.initialize(legacy)
         row=accounts.list_users(legacy)[0]
         self.assertEqual((row['label'],row['role'],row['must_change']),('保守','admin',0))
+        accounts.add_label(legacy,'プラン2')
         accounts.set_label(legacy,row['id'],'プラン2');accounts.initialize(legacy)
         self.assertEqual(accounts.list_users(legacy)[0]['label'],'プラン2')
 
@@ -193,13 +200,14 @@ class AccountTests(unittest.TestCase):
         alice_db=accounts.private(self.auth,self.uid)
         bob_id=next(u['id'] for u in accounts.list_users(self.auth) if u['username']=='bob')
         bob_db=accounts.private(self.auth,bob_id)
-        self.assertEqual(accounts.account_settings(alice_db),{'spoon_profile':None,'updated_at':None})
+        self.assertIsNone(accounts.account_settings(alice_db)['spoon_profile'])
+        self.assertFalse(accounts.account_settings(alice_db)['binding_locked'])
         fans.import_followers(alice_db,{'owner':{'id':'999','name':'fan-list-owner'},
           'followers':[{'id':'444','name':'fan'}],'complete':True})
         self.assertIsNone(accounts.account_settings(alice_db)['spoon_profile'])
         accounts.favorites(alice_db,{'users':[{'id':'444','name':'favorite'}],'revision':0})
         profile={'id':'000316644201','name':'きー','tag':'1222kii','password':'discarded'}
-        result=accounts.account_settings(alice_db,{'spoon_profile':profile,'account_id':bob_id})
+        result=accounts.account_settings(alice_db,{'spoon_profile':profile,'account_id':bob_id},confirmed=True)
         self.assertEqual(result['spoon_profile'],{'id':'316644201','name':'きー','tag':'1222kii'})
         self.assertTrue(result['updated_at'])
         accounts.private(self.auth,self.uid)
@@ -208,14 +216,17 @@ class AccountTests(unittest.TestCase):
         for payload in [{},[],{'spoon_profile':True},{'spoon_profile':{'id':'abc'}}]:
             with self.assertRaises(ValueError): accounts.account_settings(alice_db,payload)
         self.assertEqual(accounts.account_settings(alice_db),result)
-        self.assertIsNone(accounts.account_settings(alice_db,{'spoon_profile':None})['spoon_profile'])
+        administrator={'id':'c'*32,'username':'fixtureadmin','role':'admin'}
+        self.assertIsNone(accounts.account_settings(alice_db,{'spoon_profile':None},
+                          confirmed=True,allow_change=True,actor=administrator)['spoon_profile'])
         self.assertEqual(len(accounts.favorites(alice_db)['users']),1)
         from spoondev import webdata
         self.assertEqual(webdata.fan_destinations(self.database,'999',private_database=alice_db)['total'],1)
 
     def test_administrator_password_reset_preserves_identity_and_private_data(self):
         private=accounts.private(self.auth,self.uid)
-        accounts.account_settings(private,{'spoon_profile':{'id':'123','name':'Alice Spoon'}})
+        accounts.account_settings(private,{'spoon_profile':{'id':'123','name':'Alice Spoon'}},confirmed=True)
+        accounts.add_label(self.auth,'プラン3')
         accounts.set_label(self.auth,self.uid,'プラン3')
         accounts.set_role(self.auth,'alice','admin')
         token=accounts.login(self.auth,'alice','example-password-123')
@@ -264,17 +275,17 @@ class AccountTests(unittest.TestCase):
         import sqlite3
         profiledb.cache_users(self.database,[{'id':'123','name':'Own DJ','tag':'mydj'}])
         alice,csrf=self.login('alice','example-password-123');bob,bc=self.login('bob','other-password-123')
-        self.assertEqual(self.request('/api/account/settings',{'spoon_id':'https://www.spooncast.net/jp/channel/123/tab/home'},alice,csrf)[0],200)
+        self.assertEqual(self.request('/api/account/settings',{'spoon_id':'https://www.spooncast.net/jp/channel/123/tab/home','confirmed':True},alice,csrf)[0],200)
         self.assertEqual(self.request('/api/dashboard',cookie=alice)[2]['profile']['id'],'123')
         self.assertIsNone(self.request('/api/dashboard',cookie=bob)[2]['profile'])
         self.assertEqual(self.request('/api/account/settings',{},alice,csrf)[0],400)
         self.assertEqual(self.request('/api/account/settings',cookie=alice)[2]['spoon_profile']['id'],'123')
-        self.assertEqual(self.request('/api/account/settings',{'spoon_id':'https://evil.example/jp/channel/123'},alice,csrf)[0],400)
+        self.assertEqual(self.request('/api/account/settings',{'spoon_id':'https://evil.example/jp/channel/123','confirmed':True},bob,bc)[0],400)
         self.assertEqual(self.request('/api/account/settings',{'spoon_id':'123'},alice)[0],403)
         with patch('spoondev.dashboard.summary',side_effect=sqlite3.OperationalError('busy')):
             self.assertEqual(self.request('/api/dashboard',cookie=alice)[0],503)
-        self.assertEqual(self.request('/api/account/settings',{'spoon_id':None},alice,csrf)[0],200)
-        self.assertIsNone(self.request('/api/dashboard',cookie=alice)[2]['profile'])
+        self.assertEqual(self.request('/api/account/settings',{'spoon_id':None,'confirmed':True},alice,csrf)[0],403)
+        self.assertEqual(self.request('/api/dashboard',cookie=alice)[2]['profile']['id'],'123')
 
     def test_admin_reset_http_and_normalized_self_guard(self):
         accounts.create(self.auth,'kitomoya','admin-password-123',must_change=False)

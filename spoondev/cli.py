@@ -27,7 +27,7 @@ def main(argv=None):
     account.add_argument('username')
     account.add_argument('--auth-db',default='data/accounts.sqlite3')
     account.add_argument('--reset',action='store_true')
-    account.add_argument('--label',default='保守')
+    account.add_argument('--label',default='利用者')
     account.add_argument('--claim-local-data',action='store_true')
     role=commands.add_parser('set-role',help='Grant/revoke console administrator rights')
     role.add_argument('username')
@@ -64,9 +64,17 @@ def main(argv=None):
     gift.add_argument('--max-pages',type=int,default=0)
     gift.add_argument('--interval',type=float,default=3600)
     gift.add_argument('--once',action='store_true')
+    automatic = commands.add_parser('collect-auto', help='Run one shared collector for live rooms and registered DJs')
+    automatic.add_argument('--auth-db', default='data/accounts.sqlite3')
+    automatic.add_argument('--concurrency', type=int, default=4)
+    automatic.add_argument('--live-interval', type=float, default=300)
+    automatic.add_argument('--ranking-interval', type=float, default=3600)
     args = parser.parse_args(argv)
     if args.command == 'serve' and not 0 <= args.port <= 65535:
         parser.error('port must be 0..65535')
+    if args.command == 'collect-auto' and (not 1 <= args.concurrency <= 16 or
+            any(not math.isfinite(value) or value < 30 for value in (args.live_interval, args.ranking_interval))):
+        parser.error('concurrency must be 1..16; collection intervals must be at least 30 seconds')
     if args.command in {"collect", "collect-spoon",'collect-monthly'} and (not 1 <= args.concurrency <= 16 or not math.isfinite(args.interval) or args.interval < 30):
         parser.error("concurrency must be 1..16; interval must be at least 30 seconds")
     if args.command == "collect-spoon" and (args.max_rooms < 0 or args.max_pages < 1):
@@ -101,6 +109,33 @@ def main(argv=None):
             from .web import serve
             serve(args.db,args.host,args.port,auth=args.auth,auth_database=args.auth_db,public_url=args.public_url)
             return 0
+        if args.command == 'collect-auto':
+            # A mistyped account path must not quietly create another, empty
+            # account database or start collecting for the wrong installation.
+            auth_path = Path(args.auth_db).resolve()
+            if not auth_path.is_file():
+                raise ValueError('Create a login account first; the automatic collector needs an existing --auth-db.')
+            with sqlite3.connect(auth_path.as_uri() + '?mode=ro', uri=True) as connection:
+                if not connection.execute('SELECT COUNT(*) FROM accounts').fetchone()[0]:
+                    raise ValueError('Create a login account before starting the automatic collector.')
+            from .worker import run, WorkerAlreadyRunning
+            stopped = threading.Event()
+            previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+            try:
+                for sig in previous:
+                    signal.signal(sig, lambda *_: stopped.set())
+                print(json.dumps({'state': 'starting', 'database': args.db,
+                    'live_interval': args.live_interval, 'ranking_interval': args.ranking_interval}), flush=True)
+                try:
+                    result = run(args.db, args.auth_db, stop_event=stopped, concurrency=args.concurrency,
+                        live_interval=args.live_interval, ranking_interval=args.ranking_interval)
+                except WorkerAlreadyRunning:
+                    result = {'state': 'already_running', 'message': 'Existing automatic collector kept running.'}
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                return 0
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
         Path(args.db).parent.mkdir(parents=True, exist_ok=True)
         initialize(args.db)
         if args.command == "init-db":

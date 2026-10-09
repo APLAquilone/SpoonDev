@@ -12,11 +12,27 @@ from pathlib import Path
 from . import fans, profiledb
 
 
+class BindingLockedError(PermissionError):
+    """An ordinary account cannot change an already registered broadcaster."""
+
+
+class BindingConflict(ValueError):
+    """Another request completed the first registration before this one."""
+
+
+class BindingConfirmationRequired(ValueError):
+    """The displayed public profile must be explicitly confirmed before saving."""
+
+
+_SEED_LABELS = ('利用者', '管理者', 'テスト')
+
+
 def initialize(path):
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
     with sqlite3.connect(path) as c:
         c.executescript('''CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,salt TEXT NOT NULL,password TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,account_id TEXT NOT NULL,csrf TEXT NOT NULL,expires REAL NOT NULL);''')
+        c.execute('BEGIN IMMEDIATE')
         columns={r[1] for r in c.execute('PRAGMA table_info(accounts)')}
         # Before v0.2, the initial-password migration set every existing account
         # to must_change=1. It did not record whether this was a real reset.
@@ -29,6 +45,14 @@ def initialize(path):
         if legacy_password_policy:
             c.execute("UPDATE accounts SET must_change=0,must_change_reason=''")
         c.execute("UPDATE accounts SET role='admin' WHERE username='kitomoya'")
+        c.execute('CREATE TABLE IF NOT EXISTS label_catalog(name TEXT PRIMARY KEY,created_at TEXT NOT NULL)')
+        stamp=profiledb._timestamp(None)
+        c.executemany('INSERT OR IGNORE INTO label_catalog(name,created_at) VALUES(?,?)',
+                      [(label,stamp) for label in _SEED_LABELS])
+        # Legacy display labels are preserved verbatim. None of these labels
+        # grant rights; sessions always read the independent accounts.role.
+        c.execute('''INSERT OR IGNORE INTO label_catalog(name,created_at)
+                  SELECT DISTINCT label,? FROM accounts''',(stamp,))
     path.chmod(0o600)
 
 
@@ -39,7 +63,7 @@ def password_hash(password,salt):
         return hashlib.scrypt(password.encode(),salt=bytes.fromhex(salt),n=32768,r=8,p=1,maxmem=64*1024*1024).hex()
 
 
-def create(path,username,password,reset=False, *, label="保守", must_change=True):
+def create(path,username,password,reset=False, *, label="利用者", must_change=True):
     label=validate_label(label)
     if not isinstance(username,str): raise ValueError("ユーザーIDを指定してください。")
     username=username.strip().lower()
@@ -55,6 +79,7 @@ def create(path,username,password,reset=False, *, label="保守", must_change=Tr
             c.execute('DELETE FROM sessions WHERE account_id=?',(uid,))
         else:
             if old: raise ValueError('ユーザー名は登録済みです。')
+            _selected_label(c,label)
             uid=secrets.token_hex(16)
             stamp=profiledb._timestamp(None)
             c.execute('INSERT INTO accounts(id,username,salt,password,label,must_change,role,must_change_reason,created_at,password_updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
@@ -75,6 +100,7 @@ def private(path,uid):
         CREATE TABLE IF NOT EXISTS account_settings(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
           spoon_id TEXT,spoon_name TEXT,spoon_tag TEXT,updated_at TEXT);
         INSERT OR IGNORE INTO account_settings(singleton) VALUES(1);''')
+        _settings_schema(c)
     db.chmod(0o600)
     return str(db)
 
@@ -124,24 +150,94 @@ def favorites(database,payload=None):
         return {'users':[dict(r) for r in c.execute('SELECT * FROM favorites ORDER BY rowid')], 'revision':c.execute('SELECT revision FROM favorite_revision').fetchone()[0]}
 
 
-def account_settings(database,payload=None):
-    """Read/save the logged-in account's Spoon binding in its private database.
+def _settings_schema(c):
+    """Add lock metadata without rewriting any existing private registration."""
+    if not c.in_transaction:
+        c.execute('BEGIN IMMEDIATE')
+    columns={r[1] for r in c.execute('PRAGMA table_info(account_settings)')}
+    migrating='binding_locked' not in columns
+    for name,definition in [('binding_locked','INTEGER NOT NULL DEFAULT 0'),
+                            ('binding_confirmed_at','TEXT'),('binding_revision','INTEGER NOT NULL DEFAULT 0')]:
+        if name not in columns:
+            c.execute(f'ALTER TABLE account_settings ADD COLUMN {name} {definition}')
+    if migrating:
+        # An existing profile is locked at its current value. Its original
+        # registration did not have a confirmation dialog, so do not invent a
+        # historical confirmation timestamp for it.
+        c.execute('UPDATE account_settings SET binding_locked=CASE WHEN spoon_id IS NULL THEN 0 ELSE 1 END')
+    c.execute('''CREATE TABLE IF NOT EXISTS binding_audit(
+              id INTEGER PRIMARY KEY,action TEXT NOT NULL,actor_id TEXT,actor_username TEXT,
+              target_account_id TEXT,before_id TEXT,after_id TEXT,observed_at TEXT NOT NULL)''')
 
-    The HTTP caller chooses this database from the authenticated session, never
-    from a client account ID. Clearing the binding preserves fan registrations.
+
+def _setting_result(row):
+    profile={'id':row[0],'name':row[1],'tag':row[2]} if row and row[0] else None
+    return {'spoon_profile':profile,'updated_at':row[3] if row else None,
+            'binding_locked':bool(row[4]) if row else False,
+            'binding_confirmed_at':row[5] if row else None,'binding_revision':row[6] if row else 0}
+
+
+def account_settings(database,payload=None, *, allow_change=False, confirmed=False, actor=None):
+    """Read/save the authenticated account's private broadcaster association.
+
+    The HTTP caller selects the database and passes the verified session actor;
+    it must never derive allow_change/actor from a JSON request. Ordinary first
+    registration requires confirmation and atomically locks the association.
+    Only an explicit administrator operation may replace or clear it. Favorites,
+    fan imports and passwords are unaffected by this setting.
     """
+    select='''SELECT spoon_id,spoon_name,spoon_tag,updated_at,binding_locked,
+              binding_confirmed_at,binding_revision FROM account_settings WHERE singleton=1'''
     with sqlite3.connect(database) as c:
-        if payload is not None:
-            if not isinstance(payload,dict) or 'spoon_profile' not in payload:
-                raise ValueError('ご自身のSpoonプロフィールを指定してください。')
-            raw=payload['spoon_profile']
-            profile=None if raw is None else fans._user(raw)
-            c.execute('UPDATE account_settings SET spoon_id=?,spoon_name=?,spoon_tag=?,updated_at=? WHERE singleton=1',
-                      (profile['id'] if profile else None,profile['name'] if profile else None,
-                       profile['tag'] if profile else None,profiledb._timestamp(None)))
-        row=c.execute('SELECT spoon_id,spoon_name,spoon_tag,updated_at FROM account_settings WHERE singleton=1').fetchone()
-        profile={'id':row[0],'name':row[1],'tag':row[2]} if row and row[0] else None
-        return {'spoon_profile':profile,'updated_at':row[3] if row else None}
+        if payload is None:
+            return _setting_result(c.execute(select).fetchone())
+        if not isinstance(payload,dict) or 'spoon_profile' not in payload:
+            raise ValueError('ご自身のSpoonプロフィールを指定してください。')
+        raw=payload['spoon_profile']
+        profile=None if raw is None else fans._user(raw)
+        administrator=allow_change is True
+        if administrator and (not isinstance(actor,dict) or actor.get('role')!='admin'
+                              or not isinstance(actor.get('id'),str) or not re.fullmatch('[0-9a-f]{32}',actor['id'])
+                              or not isinstance(actor.get('username'),str)
+                              or not re.fullmatch('[a-z0-9_-]{3,64}',actor['username'])):
+            raise BindingLockedError('配信者の変更・解除は管理者への依頼が必要です。')
+        before=c.execute(select).fetchone()
+        if not administrator and (before and (before[0] is not None or before[4]) or profile is None):
+            raise BindingLockedError('確定済みの配信者は変更・解除できません。管理者へ依頼してください。')
+        if confirmed is not True:
+            raise BindingConfirmationRequired('表示されたSpoonプロフィールを確認して確定してください。')
+        # Read the precondition before taking the write lock, then use a CAS
+        # update. Concurrent first-registration requests cannot overwrite the
+        # winner even if they both observed an initially empty setting.
+        c.execute('BEGIN IMMEDIATE')
+        if administrator:
+            before=c.execute(select).fetchone()
+        stamp=profiledb._timestamp(None)
+        parameters=(profile['id'] if profile else None,profile['name'] if profile else None,
+                    profile['tag'] if profile else None,stamp,int(profile is not None),stamp if profile else None)
+        update='''UPDATE account_settings SET spoon_id=?,spoon_name=?,spoon_tag=?,updated_at=?,
+                  binding_locked=?,binding_confirmed_at=?,binding_revision=binding_revision+1 WHERE singleton=1'''
+        if not administrator:
+            update+=' AND spoon_id IS NULL AND binding_locked=0'
+        if c.execute(update,parameters).rowcount!=1:
+            raise BindingConflict('別の画面で配信者が確定されました。再読み込みしてください。')
+        target=Path(database).parent.name
+        target=target if re.fullmatch('[0-9a-f]{32}',target) else None
+        action=('admin_clear' if profile is None else 'admin_replace') if administrator else 'initial_bind'
+        c.execute('''INSERT INTO binding_audit(action,actor_id,actor_username,target_account_id,
+                  before_id,after_id,observed_at) VALUES(?,?,?,?,?,?,?)''',
+                  (action,actor.get('id') if isinstance(actor,dict) else None,
+                   actor.get('username') if isinstance(actor,dict) else None,target,
+                   before[0] if before else None,profile['id'] if profile else None,stamp))
+        return _setting_result(c.execute(select).fetchone())
+
+
+def binding_audit(database,limit=50):
+    if type(limit) is not int or not 1<=limit<=200:
+        raise ValueError('監査履歴は1〜200件で指定してください。')
+    with sqlite3.connect(database) as c:
+        c.row_factory=sqlite3.Row
+        return [dict(r) for r in c.execute('SELECT * FROM binding_audit ORDER BY id DESC LIMIT ?',(limit,))]
 
 
 def claim(path,uid,source):
@@ -164,6 +260,27 @@ def validate_label(label):
     return label.strip()
 
 
+def _selected_label(c,label):
+    if not c.execute('SELECT 1 FROM label_catalog WHERE name=?',(label,)).fetchone():
+        raise ValueError('登録済みのタグ候補から選択してください。新しいタグは先に追加してください。')
+
+
+def list_labels(path):
+    with sqlite3.connect(path) as c:
+        c.row_factory=sqlite3.Row
+        return [dict(r) for r in c.execute('''SELECT l.name,l.created_at,COUNT(a.id) AS user_count
+                FROM label_catalog l LEFT JOIN accounts a ON a.label=l.name
+                GROUP BY l.name ORDER BY CASE l.name WHEN '利用者' THEN 0 WHEN '管理者' THEN 1
+                WHEN 'テスト' THEN 2 ELSE 3 END,l.created_at,l.name''')]
+
+
+def add_label(path,label):
+    label=validate_label(label)
+    with sqlite3.connect(path) as c:
+        c.execute('INSERT OR IGNORE INTO label_catalog(name,created_at) VALUES(?,?)',(label,profiledb._timestamp(None)))
+    return next(item for item in list_labels(path) if item['name']==label)
+
+
 def list_users(path):
     with sqlite3.connect(path) as c:
         c.row_factory=sqlite3.Row
@@ -173,6 +290,7 @@ def list_users(path):
 def set_label(path,uid,label):
     label=validate_label(label)
     with sqlite3.connect(path) as c:
+        _selected_label(c,label)
         if c.execute('UPDATE accounts SET label=? WHERE id=?',(label,uid)).rowcount!=1: raise ValueError('ユーザーが存在しません。')
     return {'ok':True}
 

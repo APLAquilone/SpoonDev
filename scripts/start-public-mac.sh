@@ -2,6 +2,7 @@
 # HTTPS trial tunnel; accounts and private data stay on this Mac.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+case "${SPOONDEV_COLLECT:-1}" in 0|1) ;; *) echo 'SPOONDEV_COLLECT must be 0 or 1'; exit 1 ;; esac
 command -v cloudflared >/dev/null || { echo 'Run: brew install cloudflared'; exit 1; }
 python -c 'import sys; assert sys.version_info >= (3,12), "Activate the spoondev Python 3.12 environment"'
 python - <<'PY'
@@ -17,8 +18,18 @@ with socket.socket() as s:
 PY
 umask 077
 public_tmp=$(mktemp -d)
-web_pid=''; tunnel_pid=''; awake_pid=''
-cleanup(){ for pid in "$web_pid" "$tunnel_pid" "$awake_pid"; do if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi; done; rm -rf "$public_tmp"; rm -f data/public-run.json; }
+web_pid=''; tunnel_pid=''; awake_pid=''; worker_pid=''
+cleanup(){
+    for pid in "$web_pid" "$tunnel_pid" "$awake_pid"; do if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi; done
+    if [ -n "$worker_pid" ]; then
+        parent=$(ps -p "$worker_pid" -o ppid= 2>/dev/null || true)
+        if [ "${parent//[[:space:]]/}" = "$$" ]; then
+            kill "$worker_pid" 2>/dev/null || true
+            wait "$worker_pid" 2>/dev/null || true
+        fi
+    fi
+    rm -rf "$public_tmp"; rm -f data/public-run.json
+}
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 if [ -f data/public-tunnel.json ]; then
@@ -70,6 +81,13 @@ for _ in range(40):
     time.sleep(.25)
 else: raise SystemExit('Authenticated web server did not become ready')
 PY
+if [ "${SPOONDEV_COLLECT:-1}" = 1 ]; then
+    python -m spoondev collect-auto >> data/collector.log 2>&1 &
+    worker_pid=$!
+    printf 'Automatic collection enabled. Log: data/collector.log\n'
+else
+    printf 'Automatic collection disabled; existing manual collectors were kept running.\n'
+fi
 if command -v caffeinate >/dev/null; then caffeinate -i -w "$web_pid" & awake_pid=$!; fi
 printf '\nOpen this URL and log in: %s\nKeep this terminal open. Ctrl+C stops public access.\n' "$public_url"
 reload_requested=0
@@ -86,7 +104,7 @@ while true; do
     status=0
     wait "$web_pid" || status=$?
     if [ "$reload_requested" -eq 1 ]; then
-        # Wait until the old worker releases its port before starting its replacement.
+        # Replace only the web server; the collector and tunnel stay running.
         wait "$web_pid" 2>/dev/null || true
         reload_requested=0
         start_web

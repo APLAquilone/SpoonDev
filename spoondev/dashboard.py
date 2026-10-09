@@ -231,4 +231,29 @@ def summary(database, private_database=None, *, now=None):
             row = conn.execute("SELECT name FROM users WHERE id=?", (broadcaster_id,)).fetchone()
             if row:
                 result["profile"] = dict(result["profile"], name=row["name"])
+        from .worker import read_status, read_jobs
+        status = read_status(conn)
+        # Public worker status is useful; process IDs and other users' targets are not.
+        result["collection"] = {"status": {key: status[key] for key in
+            ("state", "worker_running", "heartbeat_at", "cooldown_until")},
+            "jobs": read_jobs(conn, dj_ids=[broadcaster_id])}
+        for job in result["collection"]["jobs"]:
+            source = result.get("monthly" if job["kind"] == "monthly" else "gifts")
+            if source is not None and job["kind"] in ("monthly", "gifts"):
+                source["latest_attempt"] = job["last_attempt"]
+                source["next_due_at"] = job["next_due_at"]
+                source["collection_state"] = job["state"]
+    # Shared, as-of listener metrics are independent of the DJ's average temperature.
+    from .insights import listener_insights
+    groups = (result["live"]["listeners"], result["recent_listeners"],
+              result["newly_observed_listeners"], result["monthly"]["listeners"],
+              result["gifts"]["listeners"])
+    ids = list(dict.fromkeys(str(u.get("id") or u.get("user_id")) for group in groups for u in group))
+    metrics = {}
+    for start in range(0, len(ids), 100):
+        metrics.update(listener_insights(database, ids[start:start+100],
+                                        broadcaster_id=broadcaster_id, now=now))
+    for group in groups:
+        for user in group:
+            user["insights"] = metrics.get(str(user.get("id") or user.get("user_id")))
     return result

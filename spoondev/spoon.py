@@ -40,7 +40,7 @@ def _user(value):
 
 
 def collect_spoon(base_url="https://jp-api.spooncast.net", concurrency=4,
-                  max_rooms=10, max_pages=100, timeout=20):
+                  max_rooms=10, max_pages=100, timeout=20, room_callback=None):
     """Return (canonical snapshots, explicit error strings), bounded by room/page caps."""
     if any(isinstance(v, bool) or not isinstance(v, int) or v < 1
            for v in (concurrency, max_pages)) or isinstance(max_rooms, bool) or not isinstance(max_rooms, int) or max_rooms < 0:
@@ -121,18 +121,32 @@ def collect_spoon(base_url="https://jp-api.spooncast.net", concurrency=4,
 
     def collect_room(room):
         rid, host = room
+        started_at = datetime.now(timezone.utc).isoformat()
         path = f"/lives/{rid}/listeners/"
         url = base_url + path
         seen = set()
         users = {}
         complete = False
         room_errors = []
+        page_count = 0
+
+        def finish_room():
+            finished_at = datetime.now(timezone.utc).isoformat()
+            snapshot = ({"room_id": str(rid), "broadcaster": host,
+                         "listeners": list(users.values()), "complete": complete,
+                         "observed_at": finished_at} if complete or users else None)
+            if room_callback is not None:
+                room_callback(snapshot, {"room_id": str(rid), "broadcaster_id": host['id'],
+                    "started_at": started_at, "finished_at": finished_at, "page_count": page_count,
+                    "state": 'completed' if complete else 'partial' if snapshot else 'failed'})
+            return snapshot, room_errors
         try:
             for _ in range(max_pages):
                 if url in seen:
                     raise ValueError("Listener pagination cycle")
                 seen.add(url)
                 data, next_url = page(url, path)
+                page_count += 1
                 for listener in data["results"]:
                     user = _user(listener)
                     users[user["id"]] = user
@@ -143,15 +157,11 @@ def collect_spoon(base_url="https://jp-api.spooncast.net", concurrency=4,
             if not complete:
                 room_errors.append(f"Room {rid}: listener pagination reached page cap")
         except SpoonRateLimit:
+            finish_room()
             raise
         except ValueError as exc:
             room_errors.append(f"Room {rid}: {exc}")
-        if not complete and not users:
-            return None, room_errors
-        snapshot = {"room_id": str(rid), "broadcaster": host,
-                    "listeners": list(users.values()), "complete": complete,
-                    "observed_at": datetime.now(timezone.utc).isoformat()}
-        return snapshot, room_errors
+        return finish_room()
 
     snapshots = []
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
