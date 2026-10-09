@@ -63,6 +63,8 @@ def main(argv=None):
         if args.command == 'create-user':
             import getpass
             from . import accounts
+            if args.claim_local_data and args.username.strip().lower()!='kitomoya':
+                raise ValueError('--claim-local-data は kitomoya の既存登録移行専用です。追加ユーザーには付けないでください。')
             password=getpass.getpass('Password (12+ characters): ')
             if password!=getpass.getpass('Confirm password: '): raise ValueError('パスワードが一致しません。')
             uid=accounts.create(args.auth_db,args.username,password,args.reset)

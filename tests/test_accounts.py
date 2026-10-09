@@ -72,8 +72,23 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(self.request('/api/fans?owner_id=20',cookie=alice)[2]['total'],1)
         self.assertEqual(self.request('/api/fans?owner_id=10',cookie=bob)[2]['total'],1)
         self.assertEqual(len(self.request('/api/favorites',cookie=alice)[2]['users']),1)
-        self.assertEqual(len(self.request('/api/fan-owners',cookie=alice)[2]),2)
+        self.assertEqual(len(self.request('/api/fan-owners',cookie=alice)[2]),1)
+        self.assertIsNone(self.request('/api/fans?owner_id=10',cookie=alice)[2]['owner'])
         self.assertEqual(self.request('/api/fans/clear',clear,alice,csrf)[2]['deleted_count'],0)
+
+    def test_legacy_claim_restricted_to_kitomoya(self):
+        from spoondev import fans
+        fans.initialize(self.database)
+        fans.import_followers(self.database,{'owner':{'id':'316644201','name':'legacy'},'followers':[],'complete':False})
+        with self.assertRaises(ValueError): accounts.claim(self.auth,self.uid,self.database)
+        admin=accounts.create(self.auth,'kitomoya','admin-password-123')
+        accounts.claim(self.auth,admin,self.database)
+        alice,_=self.login('alice','example-password-123')
+        kitomoya,csrf=self.login('kitomoya','admin-password-123')
+        self.assertEqual(self.request('/api/fan-owners',cookie=alice)[2],[])
+        self.assertEqual(len(self.request('/api/fan-owners',cookie=kitomoya)[2]),1)
+        self.assertEqual(self.request('/api/fans/clear',{'owner_id':'316644201','confirm':True},kitomoya,csrf)[0],200)
+        self.assertEqual(self.request('/api/fan-owners',cookie=kitomoya)[2],[])
 
     def test_stats_only_kitomoya(self):
         accounts.create(self.auth,'kitomoya','admin-password-123')

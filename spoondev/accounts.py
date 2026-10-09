@@ -99,6 +99,10 @@ def favorites(database,payload=None):
 
 
 def claim(path,uid,source):
+    with sqlite3.connect(path) as c:
+        row=c.execute('SELECT username FROM accounts WHERE id=?',(uid,)).fetchone()
+    if not row or row[0]!='kitomoya':
+        raise ValueError('既存のローカル登録の引き継ぎは kitomoya のみ利用できます。')
     target=private(path,uid)
     fans.initialize(source)
     with sqlite3.connect(source) as c:

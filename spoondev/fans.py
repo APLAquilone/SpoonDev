@@ -74,12 +74,11 @@ def import_followers(database,payload):
 
 
 def clear_followers(database, payload):
-    """Clear this owner's imported membership, preserving shared observations."""
+    """Reset this owner's fan registration, preserving shared observations."""
     if not isinstance(payload, dict) or payload.get('confirm') is not True:
         raise ValueError('登録ファンの全削除を確認してください。')
     owner_id = numeric_id(payload.get('owner_id'))
     with sqlite3.connect(database) as conn:
         deleted = conn.execute('DELETE FROM registered_fans WHERE owner_id=?', (owner_id,)).rowcount
-        conn.execute('UPDATE fan_owners SET complete=0,imported_at=? WHERE id=?',
-                     (profiledb._timestamp(None), owner_id))
+        conn.execute('DELETE FROM fan_owners WHERE id=?', (owner_id,))
     return {'owner_id': owner_id, 'deleted_count': deleted, 'fan_count': 0}
