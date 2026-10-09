@@ -180,7 +180,7 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
 
         def do_POST(self):
             path=urlsplit(self.path).path
-            if path not in ('/api/fans/import','/api/login','/api/logout','/api/favorites') or (not auth and path!='/api/fans/import'):
+            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
                 self.respond(405,{'error':'この操作は利用できません。'}); return
             if path!='/api/login' and not self.gate(): return
             origin=self.headers.get('Origin')
@@ -221,6 +221,8 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                     result=accounts.favorites(self.private_db,payload)
                     if result is None:
                         self.respond(409,{'error':'別の画面で更新されました。再読み込みしてください。'}); return
+                elif path=='/api/fans/clear':
+                    result=fans.clear_followers(self.private_db if auth else database,payload)
                 else:
                     result=fans.import_followers(self.private_db if auth else database,payload)
                 self.respond(200,result)

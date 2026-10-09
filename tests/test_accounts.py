@@ -54,6 +54,27 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(self.request('/api/favorites',cookie=alice)[0],401)
         accounts.create(self.auth,'bob','new-password-123',reset=True)
         self.assertEqual(self.request('/api/favorites',cookie=bob)[0],401)
+    def test_clear_fans_is_scoped_and_preserves_other_data(self):
+        alice,csrf=self.login('alice','example-password-123')
+        bob,bcsrf=self.login('bob','other-password-123')
+        first={'owner':{'id':'10','name':'owner'},'followers':[{'id':'123','name':'fan'}],'complete':True}
+        other={**first,'owner':{'id':'20','name':'other'}}
+        for cookie,token,payload in [(alice,csrf,first),(alice,csrf,other),(bob,bcsrf,first)]:
+            self.assertEqual(self.request('/api/fans/import',payload,cookie,token)[0],200)
+        self.request('/api/favorites',{'users':[{'id':'123','name':'favorite'}],'revision':0},alice,csrf)
+        clear={'owner_id':'10','confirm':True}
+        self.assertEqual(self.request('/api/fans/clear',clear)[0],401)
+        self.assertEqual(self.request('/api/fans/clear',clear,alice)[0],403)
+        self.assertEqual(self.request('/api/fans/clear',{'owner_id':'10'},alice,csrf)[0],400)
+        result=self.request('/api/fans/clear',clear,alice,csrf)
+        self.assertEqual(result[0],200);self.assertEqual(result[2]['deleted_count'],1)
+        self.assertEqual(self.request('/api/fans?owner_id=10',cookie=alice)[2]['total'],0)
+        self.assertEqual(self.request('/api/fans?owner_id=20',cookie=alice)[2]['total'],1)
+        self.assertEqual(self.request('/api/fans?owner_id=10',cookie=bob)[2]['total'],1)
+        self.assertEqual(len(self.request('/api/favorites',cookie=alice)[2]['users']),1)
+        self.assertEqual(len(self.request('/api/fan-owners',cookie=alice)[2]),2)
+        self.assertEqual(self.request('/api/fans/clear',clear,alice,csrf)[2]['deleted_count'],0)
+
     def test_stats_only_kitomoya(self):
         accounts.create(self.auth,'kitomoya','admin-password-123')
         admin,_=self.login('kitomoya','admin-password-123')
