@@ -103,11 +103,17 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 if route.path == '/':
                     html=Path(__file__).with_name('static').joinpath('index.html').read_text()
                     if auth:
+                        self.user['can_view_stats']=self.user['username']=='kitomoya'
+                        if not self.user['can_view_stats']:
+                            html=html.replace('id="stats"','id="stats" hidden')
                         bootstrap=json.dumps(self.user).replace('<','\\u003c')
                         html=html.replace('<script>','<script>window.spoondevAccount='+bootstrap+';</script><script>',1)
                     self.respond(200,html.encode(),'text/html; charset=utf-8')
                 elif route.path == '/api/stats':
-                    self.respond(200, webdata.stats(database))
+                    if auth and self.user['username']!='kitomoya':
+                        self.respond(403,{'error':'集計情報は管理者のみ閲覧できます。'})
+                    else:
+                        self.respond(200, webdata.stats(database))
                 elif route.path == '/api/on-air':
                     from .onair import current_public_lives, LiveStatusError
                     try:

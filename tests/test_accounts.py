@@ -46,10 +46,30 @@ class AccountTests(unittest.TestCase):
         result=self.request('/api/fans?owner_id=316644201',cookie=bob)
         self.assertEqual(result[2]['fans'],[])
         self.assertEqual(self.request('/api/fans?owner_id=316644201',cookie=alice)[2]['total'],1)
+        bob_fan={**fan,'followers':[{'id':'456','name':'bob-only'}]}
+        self.assertEqual(self.request('/api/fans/import',bob_fan,bob,bcsrf)[0],200)
+        self.assertEqual(self.request('/api/fans?owner_id=316644201',cookie=bob)[2]['fans'][0]['id'],'456')
+        self.assertEqual(self.request('/api/fans?owner_id=316644201',cookie=alice)[2]['fans'][0]['id'],'123')
         self.assertEqual(self.request('/api/logout',{},alice,csrf)[0],200)
         self.assertEqual(self.request('/api/favorites',cookie=alice)[0],401)
         accounts.create(self.auth,'bob','new-password-123',reset=True)
         self.assertEqual(self.request('/api/favorites',cookie=bob)[0],401)
+    def test_stats_only_kitomoya(self):
+        accounts.create(self.auth,'kitomoya','admin-password-123')
+        admin,_=self.login('kitomoya','admin-password-123')
+        alice,csrf=self.login('alice','example-password-123')
+        self.assertEqual(self.request('/api/stats',cookie=admin)[0],200)
+        self.assertEqual(self.request('/api/stats',cookie=alice)[0],403)
+        # Client-supplied fields cannot grant permissions.
+        self.assertEqual(self.request('/api/stats?username=kitomoya',cookie=alice)[0],403)
+        html=self.request('/',cookie=alice)[2]
+        self.assertIn('id="stats" hidden',html)
+        self.assertIn('"can_view_stats": false',html)
+        self.assertIn('ファン一覧</button>',html)
+        self.assertNotIn('id="stats" hidden',self.request('/',cookie=admin)[2])
+        # Ordinary users retain their own favorite and fan configuration.
+        self.assertEqual(self.request('/api/favorites',{'users':[],'revision':0},alice,csrf)[0],200)
+
     def test_wrong_password_and_public_validation(self):
         self.assertEqual(self.request('/api/login',{'username':'alice','password':'wrong-password-123'})[0],401)
         for _ in range(10): self.request('/api/login',{'username':'alice','password':'wrong-password-123'})
