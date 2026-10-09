@@ -1,4 +1,4 @@
-# SpoonDev
+# Spoon Insights
 
 Spoon 日本版の公開配信・リスナー一覧を取得し、配信者とリスナーの関係と温度 (`favorite_temperature`) を時刻付きで SQLite に蓄積します。Python 3.12 以降と標準ライブラリ、バックグラウンド起動には Linux の `flock` を使います。
 
@@ -203,3 +203,5 @@ cloudflared tunnel route dns spoondev spoon.example.com
 ```
 
 `bash scripts/start-public-mac.sh` はこの設定があれば固定URLのTunnelを使い、なければ従来の一時URLを使います。設定は公開用だけに置きます。再起動・リリースでURLは変わりません。Macが停止するとアクセスできなくなる点は同じです。このLinuxクラウドではMac・本人のCloudflareアカウントによる固定URLの実接続は未検証です。
+
+公開用にも取得範囲・更新頻度の説明を追加しました。画面上部の「データの取得範囲と更新頻度」を開いて確認できます。一覧のライブは直近30分、詳細は過去を含みます。取得済み配信者の月間ランキングとライブ温度は別データです。表示上の製品名は Spoon Insights に変更し、CLI・リポジトリ・フォルダ名・保存データは維持します。管理コンソールと初回パスワード変更などの機能は引き続きDevで検証します。
