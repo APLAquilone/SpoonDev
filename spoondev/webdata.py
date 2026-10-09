@@ -78,11 +78,14 @@ def user_details(database, user_id):
         result['profile_month'] = None
         result['profile_observed_at'] = None
         result['profile_complete'] = False
+        result['profile_coverage'] = None
+        result['profile_ranking_complete'] = None
         if conn.execute("SELECT 1 FROM sqlite_master WHERE name='profile_snapshots'").fetchone():
             profile = profiledb.latest_profile(conn,user_id)
             if profile and profile['month'] == datetime.now(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m'):
                 result.update(appearances=profile['appearances'],profile_month=profile['month'],
-                              profile_observed_at=profile['observed_at'],profile_complete=profile['complete'])
+                              profile_observed_at=profile['observed_at'],profile_complete=profile['complete'],
+                              profile_coverage=profile.get('coverage'),profile_ranking_complete=profile.get('ranking_complete'))
         return result
 
 

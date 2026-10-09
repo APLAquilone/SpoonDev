@@ -81,6 +81,28 @@ class FanTests(unittest.TestCase):
         self.assertEqual([u['id'] for u in webdata.fan_destinations(self.db,'10',sort='activity')['fans']],['20','21','22'])
         self.assertEqual([u['id'] for u in webdata.fan_destinations(self.db,'10',sort='oldest')['fans']],['21','20','22'])
 
+    def test_old_live_temperature_does_not_manufacture_monthly_ranking(self):
+        self.put([{'id':'315888158','name':'つくちゃん'}],True)
+        now=datetime.now(timezone.utc);month=now.astimezone(webdata.ZoneInfo('Asia/Tokyo')).strftime('%Y-%m')
+        save_snapshot(self.db,{'room_id':'past','broadcaster':{'id':'317169445','name':'DJ'},
+            'listeners':[{'id':'315888158','name':'つくちゃん','favorite_temperature':92}],
+            'complete':True,'observed_at':(now-timedelta(hours=6)).isoformat()})
+        profiledb.save_dj_ranking(self.db,{'id':'317169445','name':'DJ'},[],month,True)
+        entry=webdata.fan_destinations(self.db,'10')['fans'][0]
+        detail=webdata.user_details(self.db,'315888158')
+        self.assertEqual(entry['live'],[]);self.assertEqual(entry['monthly'],[])
+        self.assertEqual(detail['broadcasters'][0]['favorite_temperature'],92)
+        self.assertEqual(detail['appearances'],[])
+        self.assertEqual(detail['profile_coverage'],'known_broadcasters')
+        self.assertTrue(detail['profile_ranking_complete'])
+        # Monthly temperature appears only when separately indexed, in both views.
+        profiledb.save_dj_ranking(self.db,{'id':'317169445','name':'DJ'},
+            [{'user':{'id':'315888158','name':'つくちゃん'},'temperature':35}],month,False)
+        self.assertEqual(webdata.fan_destinations(self.db,'10')['fans'][0]['monthly'][0]['temperature'],35)
+        detail=webdata.user_details(self.db,'315888158')
+        self.assertEqual(detail['appearances'][0]['temperature'],35)
+        self.assertFalse(detail['profile_ranking_complete'])
+
     def test_recent_fans_are_sorted_before_pagination(self):
         self.put([str(i) for i in range(100,155)],True)
         now=datetime.now(timezone.utc)
