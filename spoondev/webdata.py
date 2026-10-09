@@ -125,3 +125,63 @@ def favorite_activity(database, user_ids):
             recent = now - timedelta(minutes=30) <= seen <= now
         users.append({'id': user_id, 'last_live_at': value, 'recent': recent})
     return {'users': users, 'checked_at': now.isoformat(), 'recent_minutes': 30}
+
+
+def fan_owners(database):
+    with _read(database) as conn:
+        return [dict(row) for row in conn.execute('''SELECT o.*,
+            (SELECT COUNT(*) FROM registered_fans f WHERE f.owner_id=o.id) AS fan_count
+            FROM fan_owners o ORDER BY imported_at DESC,id''')]
+
+
+def fan_destinations(database, owner_id, offset=0, limit=50):
+    """Join an owner's imported fans with current-month rankings and recent live sightings."""
+    from .fans import numeric_id
+    owner_id=numeric_id(owner_id)
+    if type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=50:
+        raise ValueError('Invalid pagination')
+    now=datetime.now(timezone.utc)
+    month=now.astimezone(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m')
+    cutoff=(now-timedelta(minutes=30)).isoformat(timespec='microseconds')
+    with _read(database) as conn:
+        owner=conn.execute('SELECT * FROM fan_owners WHERE id=?',(owner_id,)).fetchone()
+        if owner is None:
+            return {'owner':None,'fans':[],'has_more':False,'total':0,'month':month}
+        total=conn.execute('SELECT COUNT(*) FROM registered_fans WHERE owner_id=?',(owner_id,)).fetchone()[0]
+        rows=conn.execute(f'''WITH profiles AS ({_profiles(conn)})
+          SELECT f.user_id AS id,COALESCE(p.name,f.name,'名前未取得') AS name,
+          COALESCE(p.tag,f.tag) AS tag FROM registered_fans f LEFT JOIN profiles p ON p.id=f.user_id
+          WHERE f.owner_id=? ORDER BY f.user_id LIMIT ? OFFSET ?''',(owner_id,limit+1,offset)).fetchall()
+        users=[dict(row,monthly=[],live=[]) for row in rows[:limit]]
+        indexed=conn.execute('SELECT COUNT(DISTINCT dj_id),MAX(observed_at) FROM monthly_dj_snapshots WHERE month=?',(month,)).fetchone()
+        if users:
+            by_id={user['id']:user for user in users}
+            placeholders=','.join('?' for _ in users)
+            monthly=conn.execute(f'''WITH latest AS (
+              SELECT id,dj_id,observed_at,complete,ROW_NUMBER() OVER (
+              PARTITION BY dj_id ORDER BY observed_at DESC,id DESC) AS rn
+              FROM monthly_dj_snapshots WHERE month=?), relations AS (
+              SELECT l.listener_id,u.id AS user_id,u.name,u.tag,l.temperature,s.observed_at,s.complete,
+              ROW_NUMBER() OVER(PARTITION BY l.listener_id ORDER BY l.temperature DESC,u.id) AS position
+              FROM latest s JOIN monthly_dj_listeners l ON l.snapshot_id=s.id
+              JOIN profile_users u ON u.id=s.dj_id WHERE s.rn=1 AND l.listener_id IN ({placeholders}))
+              SELECT * FROM relations WHERE position<=5 ORDER BY listener_id,position''',
+              [month]+list(by_id)).fetchall()
+            for row in monthly:
+                by_id[row['listener_id']]['monthly'].append({key:row[key] for key in
+                    ('user_id','name','tag','temperature','observed_at','complete')})
+            live=conn.execute(f'''WITH sightings AS (
+              SELECT m.listener_id,s.broadcaster_id,MAX(s.observed_at) AS observed_at
+              FROM memberships m JOIN snapshots s ON s.id=m.snapshot_id
+              WHERE m.listener_id IN ({placeholders}) AND s.observed_at>=? AND s.observed_at<=?
+              GROUP BY m.listener_id,s.broadcaster_id), relations AS (
+              SELECT x.listener_id,u.id AS user_id,u.name,x.observed_at,
+              ROW_NUMBER() OVER(PARTITION BY x.listener_id ORDER BY x.observed_at DESC,u.id) AS position
+              FROM sightings x JOIN users u ON u.id=x.broadcaster_id)
+              SELECT * FROM relations WHERE position<=5 ORDER BY listener_id,position''',
+              list(by_id)+[cutoff,now.isoformat(timespec='microseconds')]).fetchall()
+            for row in live:
+                by_id[row['listener_id']]['live'].append({key:row[key] for key in ('user_id','name','observed_at')})
+    return {'owner':dict(owner),'fans':users,'has_more':len(rows)>limit,'total':total,
+            'month':month,'indexed_djs':indexed[0],'monthly_observed_at':indexed[1],
+            'checked_at':now.isoformat(),'recent_minutes':30,'destinations_limit':5}

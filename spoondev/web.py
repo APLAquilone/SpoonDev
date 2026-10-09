@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import webdata
 from . import profiledb
+from . import fans
 
 
 def make_server(database, host='127.0.0.1', port=8080):
@@ -14,6 +15,7 @@ def make_server(database, host='127.0.0.1', port=8080):
     if not Path(database).is_file():
         raise FileNotFoundError('Database not found; run init-db or collect-spoon first')
     profiledb.initialize(database)
+    fans.initialize(database)
 
     class Handler(BaseHTTPRequestHandler):
         def respond(self, status, body, content_type='application/json; charset=utf-8'):
@@ -40,6 +42,16 @@ def make_server(database, host='127.0.0.1', port=8080):
                     self.respond(200, Path(__file__).with_name('static').joinpath('index.html').read_bytes(), 'text/html; charset=utf-8')
                 elif route.path == '/api/stats':
                     self.respond(200, webdata.stats(database))
+                elif route.path == '/api/fan-owners':
+                    self.respond(200, webdata.fan_owners(database))
+                elif route.path == '/api/fans':
+                    owner_id = fans.numeric_id(query.get('owner_id', [''])[0])
+                    offset = int(query.get('offset', ['0'])[0])
+                    if not 0 <= offset <= 1000000:
+                        raise ValueError('Invalid offset')
+                    self.respond(200, webdata.fan_destinations(database, owner_id, offset=offset))
+                elif route.path == '/fan-export.js':
+                    self.respond(200, Path(__file__).with_name('static').joinpath('fan-export.js').read_bytes(), 'text/javascript; charset=utf-8')
                 elif route.path == '/api/favorites/activity':
                     ids = query.get('ids', [''])[0]
                     self.respond(200, webdata.favorite_activity(database, ids.split(',') if ids else []))
@@ -89,7 +101,32 @@ def make_server(database, host='127.0.0.1', port=8080):
                 self.respond(503, {'error':'データを読み込めませんでした。時間をおいて再試行してください。'})
 
         def do_POST(self):
-            self.respond(405, {'error':'このサイトは読み取り専用です。'})
+            if urlsplit(self.path).path != '/api/fans/import':
+                self.respond(405, {'error':'この操作は利用できません。'})
+                return
+            # JSON plus browser-origin checks protect LAN writes from cross-site requests.
+            origin=self.headers.get('Origin')
+            if (origin and origin != 'http://'+self.headers.get('Host','')) or self.headers.get('Sec-Fetch-Site')=='cross-site':
+                self.respond(403, {'error':'このサイトから操作してください。'})
+                return
+            if self.headers.get('Content-Type','').split(';')[0] != 'application/json':
+                self.respond(415, {'error':'JSON形式の一覧を指定してください。'})
+                return
+            try:
+                length=int(self.headers.get('Content-Length','0'))
+                if not 0 < length <= 8*1024*1024:
+                    self.respond(413, {'error':'一覧は8MB以内に分けて取り込んでください。'})
+                    return
+                self.connection.settimeout(15)
+                body=self.rfile.read(length)
+                if len(body)!=length:
+                    raise ValueError('一覧の受信が完了していません。')
+                result=fans.import_followers(database,json.loads(body))
+                self.respond(200,result)
+            except (ValueError,UnicodeError) as exc:
+                self.respond(400, {'error':str(exc)})
+            except (sqlite3.Error,OSError):
+                self.respond(503, {'error':'一覧を保存できませんでした。再試行してください。'})
 
         def log_message(self, *_):
             pass

@@ -16,4 +16,4 @@ spoondev = "spoondev.cli:main"
 include = ["spoondev*"]
 
 [tool.setuptools.package-data]
-spoondev = ["static/*.html"]
+spoondev = ["static/*.html", "static/*.js"]

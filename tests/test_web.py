@@ -43,6 +43,22 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.get('/api/users/2')['broadcasters'][0]['user_id'],'1')
         self.assertEqual(self.get('/api/history?broadcaster_id=1&listener_id=2')[0]['favorite_temperature'],42)
 
+    def test_fan_import_and_cross_origin_protection(self):
+        body=json.dumps({'owner':{'id':'1','name':'Host'},'followers':['2','99'],'complete':True}).encode()
+        url=self.base+'/api/fans/import'
+        with urlopen(Request(url,data=body,headers={'Content-Type':'application/json','Origin':self.base}),timeout=5) as response:
+            self.assertEqual(json.load(response)['fan_count'],2)
+        self.assertEqual(self.get('/api/fan-owners')[0]['id'],'1')
+        result=self.get('/api/fans?owner_id=1')
+        self.assertEqual(result['total'],2)
+        for headers,status in [({'Content-Type':'application/json','Origin':'https://other.example'},403),
+                               ({'Content-Type':'text/plain'},415)]:
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(url,data=body,headers=headers),timeout=5)
+            self.assertEqual(error.exception.code,status)
+        with urlopen(self.base+'/fan-export.js',timeout=5) as response:
+            self.assertIn(b'followers',response.read())
+
     def test_favorite_activity_api(self):
         result=self.get('/api/favorites/activity?ids=1,2,99')
         users={row['id']:row for row in result['users']}
