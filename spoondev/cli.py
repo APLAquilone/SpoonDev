@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import signal
 import sqlite3
 import sys
@@ -10,11 +11,13 @@ from .db import initialize, save_snapshot, broadcaster_listeners, listener_broad
 
 
 def main(argv=None):
+    from . import __version__
     parser = argparse.ArgumentParser(description="ID-based listener observation database")
+    parser.add_argument('--version',action='version',version='SCI '+__version__)
     parser.add_argument("--db", default="data/spoondev.sqlite3")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init-db")
-    web = commands.add_parser("serve", help="Start the read-only search website")
+    web = commands.add_parser("serve", help="Start the broadcaster workspace")
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8080)
     web.add_argument('--auth', action='store_true')
@@ -55,15 +58,29 @@ def main(argv=None):
     monthly.add_argument('--concurrency',type=int,default=4)
     monthly.add_argument('--interval',type=float,default=3600)
     monthly.add_argument('--once',action='store_true')
+    monthly.add_argument('--dj-id',action='append',help='Collect only these broadcaster IDs; repeat for more')
+    gift=commands.add_parser('collect-gifts',help='Collect public DJ-specific Spoon rankings (period unverified)')
+    gift.add_argument('--dj-id',action='append',required=True)
+    gift.add_argument('--max-pages',type=int,default=0)
+    gift.add_argument('--interval',type=float,default=3600)
+    gift.add_argument('--once',action='store_true')
     args = parser.parse_args(argv)
     if args.command == 'serve' and not 0 <= args.port <= 65535:
         parser.error('port must be 0..65535')
-    if args.command in {"collect", "collect-spoon",'collect-monthly'} and (not 1 <= args.concurrency <= 16 or args.interval < 30):
+    if args.command in {"collect", "collect-spoon",'collect-monthly'} and (not 1 <= args.concurrency <= 16 or not math.isfinite(args.interval) or args.interval < 30):
         parser.error("concurrency must be 1..16; interval must be at least 30 seconds")
     if args.command == "collect-spoon" and (args.max_rooms < 0 or args.max_pages < 1):
         parser.error("max-rooms must be nonnegative; max-pages must be positive")
+    if args.command=='collect-gifts' and (args.max_pages<0 or not math.isfinite(args.interval) or args.interval<30): parser.error('max-pages must be nonnegative; interval at least30')
     if args.command == 'collect-monthly' and (args.max_djs < 0 or args.max_pages < 0):
         parser.error('max-djs and max-pages must be nonnegative')
+    if args.command in {'collect-gifts','collect-monthly'} and args.dj_id is not None:
+        from .fans import numeric_id
+        try:
+            args.dj_id=list(dict.fromkeys(numeric_id(uid) for uid in args.dj_id))
+        except ValueError as exc:
+            parser.error(str(exc))
+    active_run=None
     try:
         if args.command == 'set-role':
             from . import accounts
@@ -103,10 +120,32 @@ def main(argv=None):
                 signal.signal(sig, lambda *_: stopped.set())
             while not stopped.is_set():
                 failed = False
+                if args.command=='collect-gifts':
+                    from .gifts import collect_gifts
+                    from .collection_status import begin,finish
+                    retry=0
+                    for uid in args.dj_id:
+                        if stopped.is_set():break
+                        rid=begin(args.db,'gifts',uid,args.interval)
+                        active_run=rid
+                        summary=collect_gifts(args.db,uid,max_pages=args.max_pages,stopped_event=stopped)
+                        finish(args.db,rid,summary)
+                        active_run=None
+                        print(json.dumps(summary,ensure_ascii=False),flush=True)
+                        failed=failed or bool(summary['errors'])
+                        retry=max(retry,summary.get('retry_after',0))
+                        if retry or stopped.is_set():break
+                    if args.once:return 1 if failed else 0
+                    stopped.wait(max(args.interval,retry));continue
                 if args.command == 'collect-monthly':
                     from .monthly import collect_monthly
+                    from .collection_status import begin,finish
+                    rid=begin(args.db,'monthly',','.join(args.dj_id or []),args.interval)
+                    active_run=rid
                     summary=collect_monthly(args.db,max_djs=args.max_djs,concurrency=args.concurrency,max_pages=args.max_pages,
-                        progress_callback=lambda progress: print(json.dumps(progress),flush=True),stopped_event=stopped)
+                        progress_callback=lambda progress: print(json.dumps(progress),flush=True),stopped_event=stopped,**({'dj_ids':args.dj_id} if args.dj_id else {}))
+                    finish(args.db,rid,summary)
+                    active_run=None
                     print(json.dumps(summary,ensure_ascii=False),flush=True)
                     if args.once:
                         return 1 if summary['errors'] else 0
@@ -114,9 +153,14 @@ def main(argv=None):
                     continue
                 if args.command == "collect-spoon":
                     from .spoon import collect_spoon, SpoonRateLimit
+                    from .collection_status import begin,finish
+                    rid=begin(args.db,'live','',args.interval)
+                    active_run=rid
                     try:
                         results, errors = collect_spoon(concurrency=args.concurrency, max_rooms=args.max_rooms, max_pages=args.max_pages)
                     except SpoonRateLimit as exc:
+                        finish(args.db,rid,{'errors':['HTTP429'],'retry_after':exc.retry_after},failed=True)
+                        active_run=None
                         print(f"Rate limited; retry delay {exc.retry_after} seconds", file=sys.stderr, flush=True)
                         if args.once:
                             return 1
@@ -127,6 +171,7 @@ def main(argv=None):
                     failed = bool(errors)
                 else:
                     results = fetch_many(args.url, concurrency=args.concurrency)
+                saved_count=0
                 for result in results:
                     if isinstance(result, Exception):
                         failed = True
@@ -134,9 +179,15 @@ def main(argv=None):
                         continue
                     try:
                         print(json.dumps({"snapshot_id": save_snapshot(args.db, result)}), flush=True)
+                        saved_count+=1
                     except (ValueError, TypeError, KeyError) as exc:
                         failed = True
                         print(f"Invalid snapshot: {exc}", file=sys.stderr)
+                if args.command=='collect-spoon':
+                    finish(args.db,rid,{'complete':not failed and all(r.get('complete') is True for r in results if isinstance(r,dict)),'room_count':saved_count,'errors':errors,
+                      'max_rooms':args.max_rooms,'max_pages':args.max_pages,
+                      'coverage':'selected_public_rooms' if args.max_rooms else 'listed_public_rooms'})
+                    active_run=None
                 if args.once:
                     return 1 if failed else 0
                 stopped.wait(args.interval)
@@ -144,3 +195,10 @@ def main(argv=None):
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if active_run is not None:
+            from .collection_status import finish
+            try:
+                finish(args.db,active_run,{'errors':['Collection ended before its result was saved.']},failed=True)
+            except (OSError,ValueError,TypeError,sqlite3.Error) as exc:
+                print(f'Could not save collection outcome: {exc}',file=sys.stderr)

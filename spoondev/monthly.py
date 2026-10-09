@@ -1,7 +1,8 @@
 """Invert public DJ monthly rankings into observed listener-to-DJ relations.
 
-Coverage is limited to broadcasters known from live observations. A ranking
-entry is a monthly profile relationship, never proof of a current live visit.
+By default coverage is limited to broadcasters known from live observations.
+Explicit numeric DJ targets can include profiles never seen broadcasting.
+A ranking entry is a monthly profile relationship, never proof of a current live visit.
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import count
@@ -14,7 +15,8 @@ import time
 from urllib.parse import urlencode, urlsplit, quote, parse_qs
 from zoneinfo import ZoneInfo
 from .collector import FetchError, fetch_snapshot
-from . import profiledb
+from . import directory, profiledb
+from .fans import numeric_id
 
 GATEWAY_BASE='https://jp-gw.spooncast.net'
 
@@ -39,18 +41,70 @@ def _entry(row):
     return user,temperature
 
 
-def collect_monthly(database,max_djs=100,concurrency=4,max_pages=0,progress_callback=None,stopped_event=None):
+def _target_profiles(conn, targets):
+    """Resolve cached public names without touching private fan/account data."""
+    has_profiles=conn.execute("SELECT 1 FROM sqlite_master WHERE name='profile_users'").fetchone() is not None
+    known={}
+    for uid in targets:
+        query='''SELECT u.id,u.name,
+          (SELECT a.tag FROM user_attributes a JOIN snapshots s ON s.id=a.snapshot_id
+           WHERE a.user_id=u.id ORDER BY s.observed_at DESC,s.id DESC LIMIT 1) AS tag,
+          u.name_observed_at AS updated_at FROM users u WHERE u.id=?'''
+        params=(uid,)
+        if has_profiles:
+            query=f'''SELECT id,name,tag,updated_at FROM ({query}
+              UNION ALL SELECT id,name,tag,updated_at FROM profile_users WHERE id=?)
+              ORDER BY updated_at DESC LIMIT 1'''
+            params=(uid,uid)
+        row=conn.execute(query,params).fetchone()
+        if row is not None:
+            known[uid]={'id':row[0],'name':row[1],'tag':row[2]}
+    return known
+
+
+def collect_monthly(database,max_djs=100,concurrency=4,max_pages=0,progress_callback=None,stopped_event=None,dj_ids=None):
     if type(max_djs) is not int or max_djs<0 or type(concurrency) is not int or concurrency<1 or type(max_pages) is not int or max_pages<0:
         raise ValueError('invalid collection limits')
+    explicit=dj_ids is not None
+    targets=None
+    if explicit:
+        if not isinstance(dj_ids,(list,tuple)):
+            raise ValueError('dj_ids requires a list of numeric IDs')
+        targets=list(dict.fromkeys(numeric_id(uid) for uid in dj_ids))
+    selection=targets[:max_djs] if explicit and max_djs else targets
     with sqlite3.connect(Path(database).resolve().as_uri()+'?mode=ro',uri=True) as conn:
         rows=conn.execute('''WITH known AS (SELECT broadcaster_id,MAX(observed_at) AS recent
           FROM snapshots GROUP BY broadcaster_id) SELECT u.id,u.name,
           (SELECT a.tag FROM user_attributes a JOIN snapshots ts ON ts.id=a.snapshot_id
            WHERE a.user_id=u.id ORDER BY ts.observed_at DESC,ts.id DESC LIMIT 1)
           FROM known k JOIN users u ON u.id=k.broadcaster_id ORDER BY k.recent DESC,u.id''').fetchall()
+        cached=_target_profiles(conn,selection) if explicit else {}
     all_djs=[{'id':u,'name':n,'tag':t} for u,n,t in rows]
-    djs=all_djs[:max_djs] if max_djs else all_djs
-    cap=len(djs)<len(all_djs)
+    resolution_errors=[]
+    if explicit:
+        djs=[]
+        for uid in selection:
+            try:
+                if stopped_event is not None and stopped_event.is_set():
+                    raise ValueError('monthly collection stopped')
+                dj=cached.get(uid)
+                if dj is None:
+                    raw=directory.resolve_user(uid)
+                    if not isinstance(raw,dict) or numeric_id(raw.get('id'))!=uid or not isinstance(raw.get('name'),str):
+                        raise ValueError('profile response did not match the requested DJ')
+                    if raw.get('tag') is not None and not isinstance(raw['tag'],str):
+                        raise ValueError('invalid DJ profile tag')
+                    dj={'id':uid,'name':raw['name'],'tag':raw.get('tag')}
+                djs.append(dj)
+            except (ValueError,OSError) as exc:
+                resolution_errors.append(f'DJ {uid}: {exc}')
+        selected_count=len(selection)
+        requested_count=len(targets)
+    else:
+        djs=all_djs[:max_djs] if max_djs else all_djs
+        selected_count=len(djs)
+        requested_count=len(all_djs)
+    cap=selected_count<requested_count
     now=datetime.now(timezone.utc)
     month=now.astimezone(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m')
     stamp=now.isoformat(timespec='microseconds')
@@ -58,6 +112,8 @@ def collect_monthly(database,max_djs=100,concurrency=4,max_pages=0,progress_call
 
     def request(url):
         with lock:
+            if datetime.now(timezone.utc).astimezone(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m')!=month:
+                raise ValueError('monthly ranking period changed; retry next round')
             if stopped_event is not None and stopped_event.is_set():
                 raise ValueError('monthly collection stopped')
             if limited[0]: raise ValueError('HTTP 429; remaining monthly requests stopped')
@@ -72,6 +128,10 @@ def collect_monthly(database,max_djs=100,concurrency=4,max_pages=0,progress_call
                     limited[0]=True
                     retry_after[0]=max(retry_after[0],result.retry_after_seconds or 60)
             raise ValueError(result.message)
+        # This upstream endpoint has an implicit current-month period. Never
+        # label a page fetched across Japan's month boundary as the prior month.
+        if datetime.now(timezone.utc).astimezone(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m')!=month:
+            raise ValueError('monthly ranking period changed; retry next round')
         return result
 
     def scan(dj):
@@ -98,7 +158,7 @@ def collect_monthly(database,max_djs=100,concurrency=4,max_pages=0,progress_call
                     page_entries[user['id']]=(user,temperature)
                 entries.update(page_entries); successful=True
                 next_value=payload.get('next')
-                if not next_value: return dj,entries,True,successful,None
+                if next_value is None or next_value=='': return dj,entries,True,successful,None
                 if not isinstance(next_value,str): raise ValueError('invalid pagination pointer')
                 next_url=urlsplit(next_value)
                 if next_url.scheme or next_url.netloc:
@@ -132,10 +192,11 @@ def collect_monthly(database,max_djs=100,concurrency=4,max_pages=0,progress_call
                 grouped.update(entries)
             if len(results)%100==0:
                 if progress_callback:
-                    progress_callback({'scanned_djs':len(results),'total_djs':len(djs),'indexed_listeners':len(grouped)})
-    errors=[error for _,_,_,_,error in results if error]
+                    progress_callback({'scanned_djs':len(results)+len(resolution_errors),'total_djs':selected_count,'indexed_listeners':len(grouped)})
+    errors=resolution_errors+[error for _,_,_,_,error in results if error]
     complete=bool(djs) and not cap and not errors
     return {'dj_count':successful_djs,'user_count':len(grouped),'complete':complete,
             'errors':errors,'month':month,'source':'monthly_profile','rank_type':'MONTHLY',
-            'coverage':'known_broadcasters','known_dj_count':len(all_djs),'selected_dj_count':len(djs),
+            'coverage':'selected_broadcasters' if explicit else 'known_broadcasters',
+            'known_dj_count':len(all_djs),'selected_dj_count':selected_count,'requested_dj_count':requested_count,
             'capped':cap,'retry_after':retry_after[0]}

@@ -92,7 +92,7 @@ class AccountTests(unittest.TestCase):
 
     def test_stats_only_kitomoya(self):
         accounts.create(self.auth,'kitomoya','admin-password-123',must_change=False)
-        admin,_=self.login('kitomoya','admin-password-123')
+        admin,admin_csrf=self.login('kitomoya','admin-password-123')
         alice,csrf=self.login('alice','example-password-123')
         self.assertEqual(self.request('/api/stats',cookie=admin)[0],200)
         self.assertEqual(self.request('/api/stats',cookie=alice)[0],403)
@@ -105,6 +105,12 @@ class AccountTests(unittest.TestCase):
         self.assertNotIn('id="stats" hidden',self.request('/',cookie=admin)[2])
         # Ordinary users retain their own favorite and fan configuration.
         self.assertEqual(self.request('/api/favorites',{'users':[],'revision':0},alice,csrf)[0],200)
+        payload={'owner':{'id':'1','name':'Owner'},'followers':['2'],'complete':True}
+        for cookie,token in ((alice,csrf),(admin,admin_csrf)):
+            self.assertEqual(self.request('/api/fans/import',payload,cookie,token)[0],200)
+        self.assertNotIn('indexed_djs',self.request('/api/fans?owner_id=1',cookie=alice)[2])
+        self.assertIn('indexed_djs',self.request('/api/fans?owner_id=1',cookie=admin)[2])
+        self.assertEqual(self.request('/api/admin/collection-status',cookie=alice)[0],403)
 
     def test_first_login_requires_password_change_and_revokes_sessions(self):
         accounts.create(self.auth,'firstuser','initial-password-123')
@@ -154,9 +160,82 @@ class AccountTests(unittest.TestCase):
             c.execute('INSERT INTO accounts VALUES(?,?,?,?)',('a'*32,'kitomoya','00'*16,'hash'))
         accounts.initialize(legacy);accounts.initialize(legacy)
         row=accounts.list_users(legacy)[0]
-        self.assertEqual((row['label'],row['role'],row['must_change']),('保守','admin',1))
+        self.assertEqual((row['label'],row['role'],row['must_change']),('保守','admin',0))
         accounts.set_label(legacy,row['id'],'プラン2');accounts.initialize(legacy)
         self.assertEqual(accounts.list_users(legacy)[0]['label'],'プラン2')
+
+    def test_v02_migration_exempts_legacy_flags_only_once(self):
+        import sqlite3
+        legacy=Path(self.temp.name)/'legacy-forced.sqlite3'
+        salt='11'*16; hashed=accounts.password_hash('existing-password-123',salt)
+        with sqlite3.connect(legacy) as c:
+            c.execute('''CREATE TABLE accounts(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,
+                     salt TEXT NOT NULL,password TEXT NOT NULL,label TEXT NOT NULL,
+                     must_change INTEGER NOT NULL,role TEXT NOT NULL)''')
+            c.execute('INSERT INTO accounts VALUES(?,?,?,?,?,?,?)',
+                      ('b'*32,'olduser',salt,hashed,'プラン2',1,'user'))
+        accounts.initialize(legacy)
+        old=accounts.list_users(legacy)[0]
+        self.assertEqual((old['must_change'],old['must_change_reason'],old['label']),(0,'','プラン2'))
+        self.assertIsNotNone(accounts.login(legacy,'olduser','existing-password-123'))
+        initial=accounts.create(legacy,'newuser','initial-password-123')
+        accounts.initialize(legacy)
+        row=next(u for u in accounts.list_users(legacy) if u['id']==initial)
+        self.assertEqual((row['must_change'],row['must_change_reason']),(1,'initial'))
+        self.assertTrue(row['created_at'])
+        accounts.create(legacy,'olduser','reset-password-123',reset=True)
+        accounts.initialize(legacy)
+        old=next(u for u in accounts.list_users(legacy) if u['username']=='olduser')
+        self.assertEqual((old['must_change'],old['must_change_reason']),(1,'reset'))
+
+    def test_private_spoon_binding_is_scoped_and_preserves_registered_data(self):
+        from spoondev import fans
+        alice_db=accounts.private(self.auth,self.uid)
+        bob_id=next(u['id'] for u in accounts.list_users(self.auth) if u['username']=='bob')
+        bob_db=accounts.private(self.auth,bob_id)
+        self.assertEqual(accounts.account_settings(alice_db),{'spoon_profile':None,'updated_at':None})
+        fans.import_followers(alice_db,{'owner':{'id':'999','name':'fan-list-owner'},
+          'followers':[{'id':'444','name':'fan'}],'complete':True})
+        self.assertIsNone(accounts.account_settings(alice_db)['spoon_profile'])
+        accounts.favorites(alice_db,{'users':[{'id':'444','name':'favorite'}],'revision':0})
+        profile={'id':'000316644201','name':'きー','tag':'1222kii','password':'discarded'}
+        result=accounts.account_settings(alice_db,{'spoon_profile':profile,'account_id':bob_id})
+        self.assertEqual(result['spoon_profile'],{'id':'316644201','name':'きー','tag':'1222kii'})
+        self.assertTrue(result['updated_at'])
+        accounts.private(self.auth,self.uid)
+        self.assertEqual(accounts.account_settings(alice_db),result)
+        self.assertIsNone(accounts.account_settings(bob_db)['spoon_profile'])
+        for payload in [{},[],{'spoon_profile':True},{'spoon_profile':{'id':'abc'}}]:
+            with self.assertRaises(ValueError): accounts.account_settings(alice_db,payload)
+        self.assertEqual(accounts.account_settings(alice_db),result)
+        self.assertIsNone(accounts.account_settings(alice_db,{'spoon_profile':None})['spoon_profile'])
+        self.assertEqual(len(accounts.favorites(alice_db)['users']),1)
+        from spoondev import webdata
+        self.assertEqual(webdata.fan_destinations(self.database,'999',private_database=alice_db)['total'],1)
+
+    def test_administrator_password_reset_preserves_identity_and_private_data(self):
+        private=accounts.private(self.auth,self.uid)
+        accounts.account_settings(private,{'spoon_profile':{'id':'123','name':'Alice Spoon'}})
+        accounts.set_label(self.auth,self.uid,'プラン3')
+        accounts.set_role(self.auth,'alice','admin')
+        token=accounts.login(self.auth,'alice','example-password-123')
+        self.assertIsNotNone(accounts.session(self.auth,token))
+        result=accounts.reset_password(self.auth,self.uid,'new-initial-password-456')
+        self.assertEqual(result,{'ok':True,'must_change':True})
+        self.assertIsNone(accounts.session(self.auth,token))
+        self.assertIsNone(accounts.login(self.auth,'alice','example-password-123'))
+        new_token=accounts.login(self.auth,'alice','new-initial-password-456')
+        self.assertTrue(accounts.session(self.auth,new_token)['must_change'])
+        accounts.initialize(self.auth)
+        row=next(u for u in accounts.list_users(self.auth) if u['id']==self.uid)
+        self.assertEqual((row['label'],row['role'],row['must_change_reason']),('プラン3','admin','reset'))
+        self.assertEqual(accounts.account_settings(private)['spoon_profile']['id'],'123')
+        with self.assertRaises(ValueError): accounts.reset_password(self.auth,self.uid,'short')
+        with self.assertRaises(ValueError): accounts.reset_password(self.auth,'f'*32,'unused-password-123')
+        self.assertIsNotNone(accounts.session(self.auth,new_token))
+        accounts.change_password(self.auth,self.uid,'new-initial-password-456','personal-password-789')
+        row=next(u for u in accounts.list_users(self.auth) if u['id']==self.uid)
+        self.assertEqual((row['must_change'],row['must_change_reason']),(0,''))
 
     def test_explicit_role_assignment_persists_and_revokes_sessions(self):
         admin=accounts.create(self.auth,'kitomoya','admin-password-123',must_change=False)
@@ -179,11 +258,86 @@ class AccountTests(unittest.TestCase):
         demoted,_=self.login('alice','example-password-123')
         self.assertEqual(self.request('/api/admin/users',cookie=demoted)[0],403)
 
+    def test_settings_dashboard_http_isolation_validation_and_errors(self):
+        from spoondev import profiledb
+        from unittest.mock import patch
+        import sqlite3
+        profiledb.cache_users(self.database,[{'id':'123','name':'Own DJ','tag':'mydj'}])
+        alice,csrf=self.login('alice','example-password-123');bob,bc=self.login('bob','other-password-123')
+        self.assertEqual(self.request('/api/account/settings',{'spoon_id':'https://www.spooncast.net/jp/channel/123/tab/home'},alice,csrf)[0],200)
+        self.assertEqual(self.request('/api/dashboard',cookie=alice)[2]['profile']['id'],'123')
+        self.assertIsNone(self.request('/api/dashboard',cookie=bob)[2]['profile'])
+        self.assertEqual(self.request('/api/account/settings',{},alice,csrf)[0],400)
+        self.assertEqual(self.request('/api/account/settings',cookie=alice)[2]['spoon_profile']['id'],'123')
+        self.assertEqual(self.request('/api/account/settings',{'spoon_id':'https://evil.example/jp/channel/123'},alice,csrf)[0],400)
+        self.assertEqual(self.request('/api/account/settings',{'spoon_id':'123'},alice)[0],403)
+        with patch('spoondev.dashboard.summary',side_effect=sqlite3.OperationalError('busy')):
+            self.assertEqual(self.request('/api/dashboard',cookie=alice)[0],503)
+        self.assertEqual(self.request('/api/account/settings',{'spoon_id':None},alice,csrf)[0],200)
+        self.assertIsNone(self.request('/api/dashboard',cookie=alice)[2]['profile'])
+
+    def test_admin_reset_http_and_normalized_self_guard(self):
+        accounts.create(self.auth,'kitomoya','admin-password-123',must_change=False)
+        root,rc=self.login('kitomoya','admin-password-123')
+        alice,ac=self.login('alice','example-password-123')
+        self.assertEqual(self.request('/api/admin/users/reset-password',{'id':self.uid,'password':'new-initial-123'},alice,ac)[0],403)
+        self.assertEqual(self.request('/api/admin/users/reset-password',{'id':self.uid,'password':'new-initial-123'},root,rc)[0],200)
+        self.assertEqual(self.request('/api/favorites',cookie=alice)[0],401)
+        initial,ic=self.login('alice','new-initial-123')
+        self.assertEqual(self.request('/api/favorites',cookie=initial)[0],403)
+        self.assertEqual(self.request('/api/admin/users/role',{'username':' KITOMOYA ','role':'user'},root,rc)[0],400)
+
     def test_wrong_password_and_public_validation(self):
         self.assertEqual(self.request('/api/login',{'username':'alice','password':'wrong-password-123'})[0],401)
         for _ in range(10): self.request('/api/login',{'username':'alice','password':'wrong-password-123'})
         self.assertEqual(self.request('/api/login',{'username':'alice','password':'example-password-123'})[0],429)
         with self.assertRaises(ValueError): web.make_server(self.database,public_url='https://example.com')
         with self.assertRaises(ValueError): web.make_server(self.database,host='0.0.0.0',auth=True,public_url='https://example.com')
+
+    def test_favorites_read_revision_stays_with_list_during_other_device_save(self):
+        import sqlite3
+        from unittest.mock import patch
+        private=accounts.private(self.auth,self.uid)
+        accounts.favorites(private,{'users':[{'id':'123','name':'old favorite'}],'revision':0})
+        connect=sqlite3.connect
+        with connect(private) as conn:
+            self.assertEqual(conn.execute('PRAGMA journal_mode=WAL').fetchone()[0],'wal')
+        committed=[]
+
+        class FavoriteRows:
+            def __init__(self,cursor):self.cursor=cursor
+            def __iter__(self):return iter(self.fetchall())
+            def fetchall(self):
+                rows=self.cursor.fetchall()
+                # Simulate another device committing after GET reads the list,
+                # before GET reads its revision. WAL allows this while the
+                # reader's transaction retains its original snapshot.
+                with connect(private) as writer:
+                    writer.execute('DELETE FROM favorites')
+                    writer.execute("INSERT INTO favorites VALUES('456','other device',NULL)")
+                    writer.execute('UPDATE favorite_revision SET revision=revision+1')
+                committed.append(True)
+                return rows
+
+        class InterleavedRead(sqlite3.Connection):
+            def execute(self,sql,*args,**kwargs):
+                cursor=super().execute(sql,*args,**kwargs)
+                return FavoriteRows(cursor) if sql=='SELECT * FROM favorites ORDER BY rowid' else cursor
+
+        def read_connection(path,*args,**kwargs):
+            if str(path)==private:kwargs['factory']=InterleavedRead
+            return connect(path,*args,**kwargs)
+
+        with patch('spoondev.accounts.sqlite3.connect',side_effect=read_connection):
+            snapshot=accounts.favorites(private)
+        self.assertEqual(committed,[True])
+        self.assertEqual(snapshot['users'],[{'id':'123','name':'old favorite','tag':None}])
+        self.assertEqual(snapshot['revision'],1)
+        # The old list must retain its old revision and be rejected on save;
+        # it cannot acquire revision 2 and overwrite the other device's change.
+        self.assertIsNone(accounts.favorites(private,{'users':snapshot['users'],'revision':snapshot['revision']}))
+        current=accounts.favorites(private)
+        self.assertEqual(current['revision'],2)
+        self.assertEqual(current['users'],[{'id':'456','name':'other device','tag':None}])
 
 if __name__=='__main__':unittest.main()

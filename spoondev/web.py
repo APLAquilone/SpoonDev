@@ -5,7 +5,7 @@ import hmac
 import threading
 import time
 from http.cookies import SimpleCookie
-from . import accounts
+from . import accounts, __version__
 from pathlib import Path
 import sqlite3
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -95,12 +95,28 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
             return False
 
         def do_GET(self):
+            try:self._get()
+            except (sqlite3.Error,OSError):self.respond(503,{'error':'データを読み込めませんでした。時間をおいて再試行してください。'})
+            except ValueError:self.respond(400,{'error':'リクエストを確認してください。'})
+
+        def _get(self):
             path=urlsplit(self.path).path
             if auth and path=='/login':
                 self.respond(200,Path(__file__).with_name('static').joinpath('login.html').read_bytes(),'text/html; charset=utf-8'); return
             if not self.gate(): return
             if auth and path=='/password':
                 self.respond(200,Path(__file__).with_name('static').joinpath('password.html').read_text().replace('CSRF_TOKEN',self.user['csrf']).encode(),'text/html; charset=utf-8');return
+            if auth and path=='/api/admin/collection-status':
+                if self.user['username']!='kitomoya':
+                    self.respond(403,{'error':'システム情報はkitomoya専用です。'});return
+                from .collection_status import read
+                with webdata._read(database) as conn:result=read(conn)
+                self.respond(200,result);return
+            if auth and path=='/api/account/settings':
+                self.respond(200,accounts.account_settings(self.private_db));return
+            if auth and path=='/api/dashboard':
+                from .dashboard import summary
+                self.respond(200,summary(database,self.private_db));return
             if auth and path=='/api/admin/users':
                 self.respond(200,accounts.list_users(auth_database));return
             if auth and path=='/api/favorites':
@@ -113,6 +129,8 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 query = parse_qs(route.query, max_num_fields=10)
                 if route.path == '/':
                     html=Path(__file__).with_name('static').joinpath('index.html').read_text()
+                    environment={'name':'公開' if public_url else '開発' if port==8081 else 'ローカル', 'version':__version__}
+                    html=html.replace('<script>','<script>window.spoondevEnvironment='+json.dumps(environment,ensure_ascii=False)+';</script><script>',1)
                     if auth:
                         self.user['can_view_stats']=self.user['username']=='kitomoya'
                         if not self.user['can_view_stats']:
@@ -138,7 +156,11 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                     offset = int(query.get('offset', ['0'])[0])
                     if not 0 <= offset <= 1000000:
                         raise ValueError('Invalid offset')
-                    self.respond(200, webdata.fan_destinations(database, owner_id, offset=offset, private_database=self.private_db if auth else None, sort=query.get('sort',['recent'])[0]))
+                    result=webdata.fan_destinations(database, owner_id, offset=offset,
+                        private_database=self.private_db if auth else None, sort=query.get('sort',['recent'])[0],
+                        q=query.get('q',[''])[0], activity=query.get('activity',['all'])[0])
+                    if auth and self.user['username']!='kitomoya':result.pop('indexed_djs',None)
+                    self.respond(200,result)
                 elif route.path == '/fan-export.js':
                     self.respond(200, Path(__file__).with_name('static').joinpath('fan-export.js').read_bytes(), 'text/javascript; charset=utf-8')
                 elif route.path == '/api/favorites/activity':
@@ -191,7 +213,7 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
 
         def do_POST(self):
             path=urlsplit(self.path).path
-            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites','/api/password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/role','/api/admin/users/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
+            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites','/api/password','/api/account/settings','/api/admin/users/reset-password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/role','/api/admin/users/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
                 self.respond(405,{'error':'この操作は利用できません。'}); return
             if path!='/api/login' and not self.gate(): return
             origin=self.headers.get('Origin')
@@ -231,11 +253,36 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 if path=='/api/password':
                     result=accounts.change_password(auth_database,self.user['id'],payload.get('current_password'),payload.get('new_password'))
                     self.respond(200,result,headers={'Set-Cookie':'spoondev_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'+('; Secure' if public_url else '')});return
-                if path=='/api/admin/users/create':
+                if path=='/api/account/settings':
+                    if 'spoon_id' not in payload: raise ValueError('spoon_id を明示してください。解除する場合は null を指定してください。')
+                    raw=payload.get('spoon_id')
+                    if raw is None:
+                        result=accounts.account_settings(self.private_db,{'spoon_profile':None})
+                    else:
+                        import re
+                        if not isinstance(raw,str): raise ValueError('プロフィールURLまたは数値IDを指定してください。')
+                        raw=raw.strip()
+                        if raw.startswith('https://'):
+                            parts=urlsplit(raw)
+                            match=re.fullmatch(r'/jp/channel/([0-9]{1,20})(?:/tab/[a-z]+)?/?',parts.path)
+                            if parts.hostname not in ('www.spooncast.net','spooncast.net') or parts.username or not match: raise ValueError('SpoonのプロフィールURLを指定してください。')
+                            raw=match.group(1)
+                        uid=fans.numeric_id(raw)
+                        profile=webdata.user_details(database,uid)
+                        if profile is None:
+                            from .directory import resolve_user, DirectoryError
+                            try: profile=resolve_user(uid)
+                            except DirectoryError:
+                                self.respond(502,{'error':'プロフィールを確認できませんでした。時間をおいて再試行してください。'});return
+                        result=accounts.account_settings(self.private_db,{'spoon_profile':{key:profile.get(key) for key in ('id','name','tag')}})
+                elif path=='/api/admin/users/reset-password':
+                    if payload.get('id')==self.user['id']: raise ValueError('自分のパスワードはアカウント設定から変更してください。')
+                    result=accounts.reset_password(auth_database,payload.get('id'),payload.get('password'))
+                elif path=='/api/admin/users/create':
                     uid=accounts.create(auth_database,payload.get('username'),payload.get('password'),label=payload.get('label','保守'))
                     result={'id':uid}
                 elif path=='/api/admin/users/role':
-                    if payload.get('username')==self.user['username']: raise ValueError('自分の権限はこの画面から変更できません。')
+                    if isinstance(payload.get('username'),str) and payload['username'].strip().lower()==self.user['username']: raise ValueError('自分の権限はこの画面から変更できません。')
                     result=accounts.set_role(auth_database,payload.get('username'),payload.get('role'))
                 elif path=='/api/admin/users/label':
                     result=accounts.set_label(auth_database,payload.get('id'),payload.get('label'))

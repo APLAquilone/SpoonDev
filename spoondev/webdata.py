@@ -12,6 +12,9 @@ from . import profiledb
 from .db import broadcaster_listeners, listener_broadcasters, temperature_history
 
 
+RECENT_SECONDS = 30 * 60
+
+
 @contextmanager
 def _read(database, private_database=None):
     uri = Path(database).resolve().as_uri() + '?mode=ro'
@@ -141,35 +144,52 @@ def fan_owners(database, private_database=None):
             FROM fan_owners o ORDER BY imported_at DESC,id''')]
 
 
-def fan_destinations(database, owner_id, offset=0, limit=50, private_database=None, sort="recent"):
+def fan_destinations(database, owner_id, offset=0, limit=50, private_database=None, sort="recent", q="", activity="all"):
     """Join an owner's imported fans with current-month rankings and recent live sightings."""
     from .fans import numeric_id
     owner_id=numeric_id(owner_id)
     if type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=50:
         raise ValueError('Invalid pagination')
-    orders={'recent':"recent DESC,CASE WHEN a.last_live_at>=? THEN a.last_live_at END DESC,f.user_id",
-            'activity':"a.last_live_at DESC,f.user_id",'oldest':"a.last_live_at IS NULL,a.last_live_at ASC,f.user_id",
-            'name':"name COLLATE NOCASE ASC,f.user_id",'name_desc':"name COLLATE NOCASE DESC,f.user_id",
-            'id':"LENGTH(f.user_id),f.user_id"}
+    if not isinstance(q,str) or len(q)>200:
+        raise ValueError('Search requires at most 200 characters')
+    q=q.strip()
+    if activity not in ('all','recent'):
+        raise ValueError('Invalid activity filter')
+    orders={'recent':"recent DESC,CASE WHEN recent THEN last_live_at END DESC,id",
+            'activity':"last_live_at DESC,id",'oldest':"last_live_at IS NULL,last_live_at ASC,id",
+            'name':"name COLLATE NOCASE ASC,id",'name_desc':"name COLLATE NOCASE DESC,id",
+            'id':"LENGTH(id),id"}
     if sort not in orders: raise ValueError('Invalid sort')
     now=datetime.now(timezone.utc)
     month=now.astimezone(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m')
-    cutoff=(now-timedelta(minutes=30)).isoformat(timespec='microseconds')
+    cutoff=(now-timedelta(seconds=RECENT_SECONDS)).isoformat(timespec='microseconds')
     with _read(database, private_database) as conn:
         owner=conn.execute('SELECT * FROM fan_owners WHERE id=?',(owner_id,)).fetchone()
         if owner is None:
-            return {'owner':None,'fans':[],'has_more':False,'total':0,'month':month}
-        total=conn.execute('SELECT COUNT(*) FROM registered_fans WHERE owner_id=?',(owner_id,)).fetchone()[0]
-        rows=conn.execute(f'''WITH profiles AS ({_profiles(conn)}), activity AS (
+            return {'owner':None,'fans':[],'has_more':False,'registered_count':0,'total':0,
+                    'month':month,'q':q,'activity':activity,'recent_seconds':RECENT_SECONDS}
+        registered_count=conn.execute('SELECT COUNT(*) FROM registered_fans WHERE owner_id=?',(owner_id,)).fetchone()[0]
+        base=f'''WITH profiles AS ({_profiles(conn)}), observations AS (
           SELECT m.listener_id,MAX(s.observed_at) AS last_live_at FROM registered_fans f
           JOIN memberships m ON m.listener_id=f.user_id JOIN snapshots s ON s.id=m.snapshot_id
-          WHERE f.owner_id=? AND s.observed_at<=? GROUP BY m.listener_id)
+          WHERE f.owner_id=? AND s.observed_at<=? GROUP BY m.listener_id), fan_rows AS (
           SELECT f.user_id AS id,COALESCE(p.name,f.name,'名前未取得') AS name,
           COALESCE(p.tag,f.tag) AS tag,a.last_live_at,
           COALESCE(a.last_live_at>=?,0) AS recent FROM registered_fans f
-          LEFT JOIN profiles p ON p.id=f.user_id LEFT JOIN activity a ON a.listener_id=f.user_id
-          WHERE f.owner_id=? ORDER BY {orders[sort]} LIMIT ? OFFSET ?''',
-          (owner_id,now.isoformat(timespec='microseconds'),cutoff,owner_id,*([cutoff] if sort=='recent' else []),limit+1,offset)).fetchall()
+          LEFT JOIN profiles p ON p.id=f.user_id LEFT JOIN observations a ON a.listener_id=f.user_id
+          WHERE f.owner_id=?) '''
+        parameters=(owner_id,now.isoformat(timespec='microseconds'),cutoff,owner_id)
+        conditions=[]
+        if q:
+            conditions.append("(id LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR tag LIKE ? ESCAPE '\\')")
+            pattern='%'+_literal(q)+'%'
+            parameters+=(pattern,pattern,pattern)
+        if activity=='recent':
+            conditions.append('recent=1')
+        where=' WHERE '+' AND '.join(conditions) if conditions else ''
+        total=conn.execute(base+'SELECT COUNT(*) FROM fan_rows'+where,parameters).fetchone()[0] if conditions else registered_count
+        rows=conn.execute(base+'SELECT * FROM fan_rows'+where+f' ORDER BY {orders[sort]} LIMIT ? OFFSET ?',
+                          parameters+(limit+1,offset)).fetchall()
         users=[dict(row,monthly=[],live=[]) for row in rows[:limit]]
         indexed=conn.execute('SELECT COUNT(DISTINCT dj_id),MAX(observed_at) FROM monthly_dj_snapshots WHERE month=?',(month,)).fetchone()
         if users:
@@ -200,6 +220,7 @@ def fan_destinations(database, owner_id, offset=0, limit=50, private_database=No
               list(by_id)+[cutoff,now.isoformat(timespec='microseconds')]).fetchall()
             for row in live:
                 by_id[row['listener_id']]['live'].append({key:row[key] for key in ('user_id','name','observed_at')})
-    return {'owner':dict(owner),'fans':users,'has_more':len(rows)>limit,'total':total,
+    return {'owner':dict(owner),'fans':users,'has_more':len(rows)>limit,'registered_count':registered_count,'total':total,
             'month':month,'indexed_djs':indexed[0],'monthly_observed_at':indexed[1],
-            'checked_at':now.isoformat(),'recent_minutes':30,'destinations_limit':5}
+            'checked_at':now.isoformat(),'recent_minutes':RECENT_SECONDS/60,'recent_seconds':RECENT_SECONDS,
+            'q':q,'activity':activity,'destinations_limit':5}

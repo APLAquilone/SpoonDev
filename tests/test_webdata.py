@@ -113,4 +113,97 @@ class WebDataTests(unittest.TestCase):
         history(self.path,'100','200')
         self.assertEqual(self.path.read_bytes(),before)
 
+    def test_fan_search_filters_entire_list_before_sort_and_pagination(self):
+        from spoondev import fans, profiledb, webdata
+        profiledb.initialize(self.path); fans.initialize(self.path)
+        followers=[{'id':str(i),'name':f'Name {159-i:02d}'} for i in range(100,160)]
+        for i in range(125,160): followers[i-100]['tag']='matching-tag'
+        fans.import_followers(self.path,{'owner':{'id':'10','name':'owner'},
+            'followers':followers,'complete':True})
+        first=webdata.fan_destinations(self.path,'10',q='matching',sort='name',limit=20)
+        last=webdata.fan_destinations(self.path,'10',q='matching',sort='name',limit=20,offset=20)
+        self.assertEqual(first['registered_count'],60)
+        self.assertEqual(first['total'],35)
+        self.assertEqual(last['total'],35)
+        self.assertTrue(first['has_more']);self.assertFalse(last['has_more'])
+        rows=first['fans']+last['fans']
+        self.assertEqual(len(rows),35)
+        self.assertEqual([row['name'] for row in rows],sorted(row['name'] for row in rows))
+        self.assertEqual(webdata.fan_destinations(self.path,'10',q='159')['fans'][0]['id'],'159')
+        self.assertIn('159',[row['id'] for row in webdata.fan_destinations(self.path,'10',q='59')['fans']])
+        missing=webdata.fan_destinations(self.path,'404',q='matching',activity='recent')
+        self.assertEqual(missing['registered_count'],0);self.assertEqual(missing['total'],0)
+
+    def test_fan_search_literal_wildcards_and_invalid_filters(self):
+        from spoondev import fans, profiledb, webdata
+        profiledb.initialize(self.path);fans.initialize(self.path)
+        fans.import_followers(self.path,{'owner':{'id':'10','name':'owner'},'followers':[
+            {'id':'300','name':'literal%under_score\\name','tag':'literal-tag'},
+            {'id':'301','name':'ordinary','tag':'plain'}],'complete':True})
+        before=self.path.read_bytes()
+        for q in ('%','_','\\','literal-tag'):
+            rows=webdata.fan_destinations(self.path,'10',q=q)
+            self.assertEqual([row['id'] for row in rows['fans']],['300'])
+            self.assertEqual(rows['registered_count'],2)
+            self.assertEqual(rows['total'],1)
+        self.assertEqual(webdata.fan_destinations(self.path,'10',q="' OR 1=1 --")['total'],0)
+        for kwargs in ({'q':None},{'q':True},{'q':'x'*201},{'activity':'recent OR 1=1'}):
+            with self.assertRaises(ValueError):webdata.fan_destinations(self.path,'10',**kwargs)
+        self.assertEqual(self.path.read_bytes(),before)
+
+    def test_fan_recent_filter_and_counts_stay_with_private_account(self):
+        from spoondev import fans, profiledb, webdata
+        profiledb.initialize(self.path);fans.initialize(self.path)
+        private=Path(self.temp.name)/'alice.sqlite3';other=Path(self.temp.name)/'bob.sqlite3'
+        for path in (private,other):fans.initialize(path);profiledb.initialize(path)
+        owner={'id':'10','name':'same owner'}
+        fans.import_followers(private,{'owner':owner,'followers':[
+            {'id':'200','name':'alice recent'}, {'id':'201','name':'alice old'},
+            {'id':'299','name':'future alice'}],'complete':True})
+        for path in (self.path,other):
+            fans.import_followers(path,{'owner':owner,'followers':[{'id':'999','name':'bob secret'}],'complete':True})
+        now=datetime.now(timezone.utc)
+        for uid,name,minutes in [('200','alice recent',5),('201','alice old',40),
+                                 ('299','future alice',-2),('999','bob secret',5)]:
+            save_snapshot(self.path,{'room_id':'room','broadcaster':{'id':'100','name':'host'},
+                'listeners':[{'id':uid,'name':name}],'complete':True,
+                'observed_at':(now-timedelta(minutes=minutes)).isoformat()})
+        before=(self.path.read_bytes(),private.read_bytes(),other.read_bytes())
+        result=webdata.fan_destinations(self.path,'10',private_database=private,activity='recent',q='alice')
+        self.assertEqual(result['registered_count'],3);self.assertEqual(result['total'],1)
+        self.assertEqual([row['id'] for row in result['fans']],['200'])
+        self.assertEqual(result['recent_seconds'],webdata.RECENT_SECONDS)
+        self.assertEqual(result['fans'][0]['live'][0]['user_id'],'100')
+        self.assertEqual(webdata.fan_destinations(self.path,'10',private_database=private,q='bob secret')['total'],0)
+        bob=webdata.fan_destinations(self.path,'10',private_database=other,activity='recent')
+        self.assertEqual(bob['registered_count'],1);self.assertEqual(bob['total'],1)
+        self.assertEqual([row['id'] for row in bob['fans']],['999'])
+        self.assertEqual((self.path.read_bytes(),private.read_bytes(),other.read_bytes()),before)
+
+    def test_fan_route_passes_search_and_activity_filters(self):
+        import http.client
+        import json
+        import threading
+        from urllib.parse import urlencode
+        from spoondev import fans, web
+        server=web.make_server(self.path,port=0)
+        self.addCleanup(server.server_close)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        self.addCleanup(thread.join);self.addCleanup(server.shutdown)
+        fans.import_followers(self.path,{'owner':{'id':'10','name':'owner'},'followers':[
+            {'id':'200','name':'match% recent'},{'id':'999','name':'other'}],'complete':True})
+        save_snapshot(self.path,{'room_id':'room','broadcaster':{'id':'100','name':'host'},
+            'listeners':[{'id':'200','name':'match% recent'}],'complete':True,
+            'observed_at':(datetime.now(timezone.utc)-timedelta(minutes=2)).isoformat()})
+        for query,expected in (({'owner_id':'10','q':'%','activity':'recent'},200),
+                               ({'owner_id':'10','activity':'invalid'},400)):
+            conn=http.client.HTTPConnection('127.0.0.1',server.server_port)
+            conn.request('GET','/api/fans?'+urlencode(query))
+            response=conn.getresponse();result=json.loads(response.read());conn.close()
+            self.assertEqual(response.status,expected)
+            if expected==200:
+                self.assertEqual(result['registered_count'],2);self.assertEqual(result['total'],1)
+                self.assertEqual(result['activity'],'recent');self.assertEqual(result['q'],'%')
+                self.assertEqual([row['id'] for row in result['fans']],['200'])
+
 if __name__=='__main__': unittest.main()

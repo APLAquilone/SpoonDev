@@ -34,6 +34,18 @@ class MonthlyTests(unittest.TestCase):
             summary=collect_monthly(self.path)
         self.assertEqual(summary['month'],'2026-10')
 
+    def test_month_boundary_response_is_not_saved_under_previous_period(self):
+        before=self.path.read_bytes()
+        old=datetime(2026,10,31,14,59,59,tzinfo=timezone.utc)
+        new=datetime(2026,10,31,15,0,0,tzinfo=timezone.utc)
+        with patch('spoondev.monthly.datetime') as clock,patch('spoondev.monthly.fetch_snapshot',return_value=self.page):
+            clock.now.side_effect=[old,old,new]
+            summary=collect_monthly(self.path,max_djs=1)
+        self.assertFalse(summary['complete'])
+        self.assertEqual(summary['dj_count'],0)
+        self.assertIn('period changed',summary['errors'][0])
+        self.assertEqual(before,self.path.read_bytes())
+
     def test_partial_failure_and_cap(self):
         def fetch(url):
             return self.page if '/10/' in url else FetchError(url,'HTTP 500',500)
@@ -116,5 +128,82 @@ class MonthlyTests(unittest.TestCase):
             cyclic=collect_monthly(self.path,max_djs=1,max_pages=0)
         self.assertIn('page cap',capped['errors'][0])
         self.assertIn('pagination loop',cyclic['errors'][0])
+
+    def test_explicit_cached_profile_never_seen_live_is_targeted_only(self):
+        profiledb.initialize(self.path)
+        profiledb.cache_users(self.path,[{'id':'123','name':'profile-only DJ','tag':'newdj'}])
+        with patch('spoondev.monthly.fetch_snapshot',return_value=self.page) as fetch,patch('spoondev.monthly.directory.resolve_user') as resolve:
+            result=collect_monthly(self.path,dj_ids=['123'])
+        resolve.assert_not_called()
+        self.assertEqual(fetch.call_args.args[0],'https://jp-gw.spooncast.net/favorite-temperatures/djs/123/rankings?rankType=MONTHLY')
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['coverage'],'selected_broadcasters')
+        self.assertEqual((result['known_dj_count'],result['selected_dj_count'],result['dj_count']),(2,1,1))
+        self.assertEqual(profiledb.latest_profile(self.path,'30')['appearances'][0]['user_id'],'123')
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0],2)
+
+    def test_explicit_observed_listener_profile_and_latest_cached_name(self):
+        profiledb.initialize(self.path)
+        profiledb.cache_users(self.path,[{'id':'99','name':'new profile name','tag':'new-tag'}],'2026-10-02T00:00:00Z')
+        with patch('spoondev.monthly.fetch_snapshot',return_value=self.page),patch('spoondev.monthly.directory.resolve_user') as resolve:
+            result=collect_monthly(self.path,dj_ids=['99'])
+        resolve.assert_not_called()
+        self.assertEqual(result['dj_count'],1)
+        self.assertEqual(profiledb.profile_user(self.path,'99')['name'],'new profile name')
+        self.assertEqual(profiledb.latest_profile(self.path,'30')['appearances'][0]['tag'],'new-tag')
+
+    def test_explicit_unknown_profile_resolved_and_duplicate_ids_normalized(self):
+        resolved={'id':'456','name':'resolved DJ','tag':'resolved-tag','last_seen_at':None}
+        with patch('spoondev.monthly.fetch_snapshot',return_value=self.page) as fetch,patch('spoondev.monthly.directory.resolve_user',return_value=resolved) as resolve:
+            result=collect_monthly(self.path,dj_ids=['00456',456,'456'])
+        resolve.assert_called_once_with('456')
+        self.assertEqual(fetch.call_count,1)
+        self.assertEqual(result['selected_dj_count'],1)
+        self.assertEqual(result['requested_dj_count'],1)
+        self.assertEqual(profiledb.latest_profile(self.path,'30')['appearances'][0]['name'],'resolved DJ')
+
+    def test_explicit_lookup_failure_reports_target_and_does_not_create_data(self):
+        before=self.path.read_bytes()
+        with patch('spoondev.monthly.fetch_snapshot') as fetch,patch('spoondev.monthly.directory.resolve_user',side_effect=ValueError('profile unavailable')):
+            result=collect_monthly(self.path,dj_ids=['456'])
+        fetch.assert_not_called()
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['selected_dj_count'],1)
+        self.assertEqual(result['dj_count'],0)
+        self.assertIn('DJ 456: profile unavailable',result['errors'])
+        self.assertEqual(before,self.path.read_bytes())
+
+    def test_explicit_cap_only_resolves_selected_targets_and_error_is_not_complete(self):
+        with patch('spoondev.monthly.fetch_snapshot',return_value=self.page),patch('spoondev.monthly.directory.resolve_user') as resolve:
+            capped=collect_monthly(self.path,max_djs=1,dj_ids=['10','999'])
+        resolve.assert_not_called()
+        self.assertEqual((capped['selected_dj_count'],capped['requested_dj_count']),(1,2))
+        self.assertTrue(capped['capped'])
+        self.assertFalse(capped['complete'])
+        with patch('spoondev.monthly.fetch_snapshot',return_value=self.page),patch('spoondev.monthly.directory.resolve_user',side_effect=ValueError('not found')),patch('spoondev.monthly.time.sleep'):
+            failed=collect_monthly(self.path,max_djs=0,dj_ids=['10','999'])
+        self.assertEqual((failed['selected_dj_count'],failed['dj_count']),(2,1))
+        self.assertFalse(failed['complete'])
+        self.assertFalse(failed['capped'])
+
+    def test_explicit_invalid_and_empty_selection_never_falls_back_to_known(self):
+        for selection in ('10',[True],['0'],['../10'],[1.5]):
+            with self.subTest(selection=selection),self.assertRaises(ValueError):
+                collect_monthly(self.path,dj_ids=selection)
+        with patch('spoondev.monthly.fetch_snapshot') as fetch,patch('spoondev.monthly.directory.resolve_user') as resolve:
+            result=collect_monthly(self.path,dj_ids=[])
+        fetch.assert_not_called()
+        resolve.assert_not_called()
+        self.assertEqual(result['selected_dj_count'],0)
+        self.assertEqual(result['coverage'],'selected_broadcasters')
+        self.assertFalse(result['complete'])
+
+    def test_invalid_falsey_pagination_is_not_reported_complete(self):
+        for pointer in (False,0,[],{}):
+            with self.subTest(pointer=pointer),patch('spoondev.monthly.fetch_snapshot',return_value=dict(self.page,next=pointer)):
+                result=collect_monthly(self.path,max_djs=1)
+                self.assertFalse(result['complete'])
+                self.assertTrue(result['errors'])
 
 if __name__=='__main__': unittest.main()

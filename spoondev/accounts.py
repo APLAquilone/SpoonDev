@@ -18,8 +18,16 @@ def initialize(path):
         c.executescript('''CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,salt TEXT NOT NULL,password TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,account_id TEXT NOT NULL,csrf TEXT NOT NULL,expires REAL NOT NULL);''')
         columns={r[1] for r in c.execute('PRAGMA table_info(accounts)')}
-        for name,definition in [('label',"TEXT NOT NULL DEFAULT '保守'"),('must_change','INTEGER NOT NULL DEFAULT 1'),('role',"TEXT NOT NULL DEFAULT 'user'")]:
+        # Before v0.2, the initial-password migration set every existing account
+        # to must_change=1. It did not record whether this was a real reset.
+        # Exempt those legacy flags once; future create/reset operations carry
+        # their reason and retain the requirement across server restarts.
+        legacy_password_policy = 'must_change_reason' not in columns
+        for name,definition in [('label',"TEXT NOT NULL DEFAULT '保守'"),('must_change','INTEGER NOT NULL DEFAULT 0'),('role',"TEXT NOT NULL DEFAULT 'user'"),
+                                ('must_change_reason',"TEXT NOT NULL DEFAULT ''"),('created_at','TEXT'),('password_updated_at','TEXT'),('last_login_at','TEXT')]:
             if name not in columns: c.execute(f'ALTER TABLE accounts ADD COLUMN {name} {definition}')
+        if legacy_password_policy:
+            c.execute("UPDATE accounts SET must_change=0,must_change_reason=''")
         c.execute("UPDATE accounts SET role='admin' WHERE username='kitomoya'")
     path.chmod(0o600)
 
@@ -42,12 +50,15 @@ def create(path,username,password,reset=False, *, label="保守", must_change=Tr
         old=c.execute('SELECT id FROM accounts WHERE username=?',(username,)).fetchone()
         if reset:
             if not old: raise ValueError('ユーザーが存在しません。')
-            uid=old[0]; c.execute('UPDATE accounts SET salt=?,password=?,must_change=? WHERE id=?',(salt,hashed,int(must_change),uid))
+            uid=old[0]; c.execute('UPDATE accounts SET salt=?,password=?,must_change=?,must_change_reason=?,password_updated_at=? WHERE id=?',
+                                 (salt,hashed,int(must_change),'reset' if must_change else '',profiledb._timestamp(None),uid))
             c.execute('DELETE FROM sessions WHERE account_id=?',(uid,))
         else:
             if old: raise ValueError('ユーザー名は登録済みです。')
             uid=secrets.token_hex(16)
-            c.execute('INSERT INTO accounts(id,username,salt,password,label,must_change,role) VALUES(?,?,?,?,?,?,?)',(uid,username,salt,hashed,label,int(must_change),'admin' if username=='kitomoya' else 'user'))
+            stamp=profiledb._timestamp(None)
+            c.execute('INSERT INTO accounts(id,username,salt,password,label,must_change,role,must_change_reason,created_at,password_updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                      (uid,username,salt,hashed,label,int(must_change),'admin' if username=='kitomoya' else 'user','initial' if must_change else '',stamp,stamp))
     private(path,uid)
     return uid
 
@@ -60,7 +71,10 @@ def private(path,uid):
     with sqlite3.connect(db) as c:
         c.executescript('''CREATE TABLE IF NOT EXISTS favorites(id TEXT PRIMARY KEY,name TEXT,tag TEXT);
         CREATE TABLE IF NOT EXISTS favorite_revision(revision INTEGER NOT NULL);
-        INSERT INTO favorite_revision SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM favorite_revision);''')
+        INSERT INTO favorite_revision SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM favorite_revision);
+        CREATE TABLE IF NOT EXISTS account_settings(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+          spoon_id TEXT,spoon_name TEXT,spoon_tag TEXT,updated_at TEXT);
+        INSERT OR IGNORE INTO account_settings(singleton) VALUES(1);''')
     db.chmod(0o600)
     return str(db)
 
@@ -75,6 +89,7 @@ def login(path,username,password):
         token=secrets.token_hex(32); csrf=secrets.token_hex(32)
         c.execute('DELETE FROM sessions WHERE expires<?',(time.time(),))
         c.execute('INSERT INTO sessions VALUES(?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),row[0],csrf,time.time()+7*86400))
+        c.execute('UPDATE accounts SET last_login_at=? WHERE id=?',(profiledb._timestamp(None),row[0]))
         return token
 
 
@@ -91,6 +106,11 @@ def logout(path,token):
 
 def favorites(database,payload=None):
     with sqlite3.connect(database) as c:
+        if payload is None:
+            # A phone/PC save can commit between the two SELECTs below. Keep
+            # users and revision in one read snapshot so the optimistic guard
+            # cannot accidentally accept an outdated list with a new revision.
+            c.execute('BEGIN')
         if payload is not None:
             users=payload.get('users'); revision=payload.get('revision')
             if not isinstance(users,list) or len(users)>2000 or type(revision) is not int: raise ValueError('お気に入りの形式を確認してください。')
@@ -102,6 +122,26 @@ def favorites(database,payload=None):
             c.execute('UPDATE favorite_revision SET revision=revision+1')
         c.row_factory=sqlite3.Row
         return {'users':[dict(r) for r in c.execute('SELECT * FROM favorites ORDER BY rowid')], 'revision':c.execute('SELECT revision FROM favorite_revision').fetchone()[0]}
+
+
+def account_settings(database,payload=None):
+    """Read/save the logged-in account's Spoon binding in its private database.
+
+    The HTTP caller chooses this database from the authenticated session, never
+    from a client account ID. Clearing the binding preserves fan registrations.
+    """
+    with sqlite3.connect(database) as c:
+        if payload is not None:
+            if not isinstance(payload,dict) or 'spoon_profile' not in payload:
+                raise ValueError('ご自身のSpoonプロフィールを指定してください。')
+            raw=payload['spoon_profile']
+            profile=None if raw is None else fans._user(raw)
+            c.execute('UPDATE account_settings SET spoon_id=?,spoon_name=?,spoon_tag=?,updated_at=? WHERE singleton=1',
+                      (profile['id'] if profile else None,profile['name'] if profile else None,
+                       profile['tag'] if profile else None,profiledb._timestamp(None)))
+        row=c.execute('SELECT spoon_id,spoon_name,spoon_tag,updated_at FROM account_settings WHERE singleton=1').fetchone()
+        profile={'id':row[0],'name':row[1],'tag':row[2]} if row and row[0] else None
+        return {'spoon_profile':profile,'updated_at':row[3] if row else None}
 
 
 def claim(path,uid,source):
@@ -127,7 +167,7 @@ def validate_label(label):
 def list_users(path):
     with sqlite3.connect(path) as c:
         c.row_factory=sqlite3.Row
-        return [dict(r) for r in c.execute('SELECT id,username,label,role,must_change FROM accounts ORDER BY username')]
+        return [dict(r) for r in c.execute('SELECT id,username,label,role,must_change,must_change_reason,created_at,password_updated_at,last_login_at FROM accounts ORDER BY username')]
 
 
 def set_label(path,uid,label):
@@ -155,9 +195,22 @@ def change_password(path,uid,current,new):
             raise ValueError('現在のパスワードを確認してください。')
         if current==new: raise ValueError('初期パスワードとは異なるパスワードを設定してください。')
         salt=secrets.token_hex(16);hashed=password_hash(new,salt)
-        c.execute('UPDATE accounts SET salt=?,password=?,must_change=0 WHERE id=?',(salt,hashed,uid))
+        c.execute("UPDATE accounts SET salt=?,password=?,must_change=0,must_change_reason='',password_updated_at=? WHERE id=?",
+                  (salt,hashed,profiledb._timestamp(None),uid))
         c.execute('DELETE FROM sessions WHERE account_id=?',(uid,))
     return {'ok':True}
+
+
+def reset_password(path,uid,password):
+    """Set an administrator-provided initial password; revoke all old sessions."""
+    salt=secrets.token_hex(16);hashed=password_hash(password,salt)
+    with sqlite3.connect(path) as c:
+        if c.execute('''UPDATE accounts SET salt=?,password=?,must_change=1,
+                     must_change_reason='reset',password_updated_at=? WHERE id=?''',
+                     (salt,hashed,profiledb._timestamp(None),uid)).rowcount!=1:
+            raise ValueError('ユーザーが存在しません。')
+        c.execute('DELETE FROM sessions WHERE account_id=?',(uid,))
+    return {'ok':True,'must_change':True}
 
 
 def set_role(path,username,role):
