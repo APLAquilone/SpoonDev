@@ -17,6 +17,14 @@ def main(argv=None):
     web = commands.add_parser("serve", help="Start the read-only search website")
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8080)
+    web.add_argument('--auth', action='store_true')
+    web.add_argument('--auth-db', default='data/accounts.sqlite3')
+    web.add_argument('--public-url')
+    account=commands.add_parser('create-user',help='Create or reset an account (password prompted locally)')
+    account.add_argument('username')
+    account.add_argument('--auth-db',default='data/accounts.sqlite3')
+    account.add_argument('--reset',action='store_true')
+    account.add_argument('--claim-local-data',action='store_true')
     imp = commands.add_parser("import")
     imp.add_argument("file", type=Path)
     report = commands.add_parser("report")
@@ -52,9 +60,18 @@ def main(argv=None):
     if args.command == 'collect-monthly' and (args.max_djs < 0 or args.max_pages < 0):
         parser.error('max-djs and max-pages must be nonnegative')
     try:
+        if args.command == 'create-user':
+            import getpass
+            from . import accounts
+            password=getpass.getpass('Password (12+ characters): ')
+            if password!=getpass.getpass('Confirm password: '): raise ValueError('パスワードが一致しません。')
+            uid=accounts.create(args.auth_db,args.username,password,args.reset)
+            if args.claim_local_data: accounts.claim(args.auth_db,uid,args.db)
+            print('Account saved: '+args.username)
+            return 0
         if args.command == 'serve':
             from .web import serve
-            serve(args.db,args.host,args.port)
+            serve(args.db,args.host,args.port,auth=args.auth,auth_database=args.auth_db,public_url=args.public_url)
             return 0
         Path(args.db).parent.mkdir(parents=True, exist_ok=True)
         initialize(args.db)

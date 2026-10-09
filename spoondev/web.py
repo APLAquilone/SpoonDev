@@ -1,6 +1,11 @@
 """Local, read-only search website for the observation database."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import hmac
+import threading
+import time
+from http.cookies import SimpleCookie
+from . import accounts
 from pathlib import Path
 import sqlite3
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -10,7 +15,31 @@ from . import profiledb
 from . import fans
 
 
-def make_server(database, host='127.0.0.1', port=8080):
+class LimitedServer(ThreadingHTTPServer):
+    """Bound active requests so slow clients cannot create unlimited threads."""
+    def __init__(self,*args,**kwargs):
+        self.slots=threading.BoundedSemaphore(16)
+        super().__init__(*args,**kwargs)
+    def process_request(self,request,address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request); return
+        try: super().process_request(request,address)
+        except BaseException:
+            self.slots.release(); raise
+    def process_request_thread(self,request,address):
+        try: super().process_request_thread(request,address)
+        finally: self.slots.release()
+
+
+def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_database='data/accounts.sqlite3', public_url=None):
+    if public_url:
+        parsed=urlsplit(public_url)
+        if not auth or host not in ('127.0.0.1','localhost') or parsed.scheme!='https' or not parsed.netloc or parsed.path not in ('','/') or parsed.query or parsed.fragment or parsed.username:
+            raise ValueError('External publication requires auth, a loopback host, and an HTTPS origin')
+        public_url='https://'+parsed.netloc
+    if auth: accounts.initialize(auth_database)
+    login_lock=threading.Lock()
+    attempts=[]
     database = str(Path(database).resolve())
     if not Path(database).is_file():
         raise FileNotFoundError('Database not found; run init-db or collect-spoon first')
@@ -18,7 +47,7 @@ def make_server(database, host='127.0.0.1', port=8080):
     fans.initialize(database)
 
     class Handler(BaseHTTPRequestHandler):
-        def respond(self, status, body, content_type='application/json; charset=utf-8'):
+        def respond(self, status, body, content_type='application/json; charset=utf-8', headers=None):
             if not isinstance(body, bytes):
                 body = json.dumps(body, ensure_ascii=False, allow_nan=False).encode('utf-8')
             self.send_response(status)
@@ -28,10 +57,43 @@ def make_server(database, host='127.0.0.1', port=8080):
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
             self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+            for key,value in (headers or {}).items(): self.send_header(key,value)
             self.end_headers()
             self.wfile.write(body)
 
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(15)
+
+        def handle(self):
+            try: super().handle()
+            except (ConnectionResetError,BrokenPipeError,TimeoutError): pass
+
+        def actor(self):
+            self.token=''
+            try:
+                cookie=SimpleCookie(); cookie.load(self.headers.get('Cookie',''))
+                self.token=cookie['spoondev_session'].value if 'spoondev_session' in cookie else ''
+            except Exception: pass
+            self.user=accounts.session(auth_database,self.token) if auth else None
+            self.private_db=accounts.private(auth_database,self.user['id']) if self.user else None
+            return self.user
+
+        def gate(self):
+            if not auth: return True
+            if public_url and self.headers.get('Host')!=urlsplit(public_url).netloc:
+                self.respond(403,{'error':'Invalid host'}); return False
+            if self.actor(): return True
+            self.respond(303 if urlsplit(self.path).path=='/' else 401,{'error':'ログインしてください。'},headers={'Location':'/login'})
+            return False
+
         def do_GET(self):
+            path=urlsplit(self.path).path
+            if auth and path=='/login':
+                self.respond(200,Path(__file__).with_name('static').joinpath('login.html').read_bytes(),'text/html; charset=utf-8'); return
+            if not self.gate(): return
+            if auth and path=='/api/favorites':
+                self.respond(200,accounts.favorites(self.private_db)); return
             if len(self.path) > 4096:
                 self.respond(414, {'error':'リクエストが長すぎます。'})
                 return
@@ -39,7 +101,11 @@ def make_server(database, host='127.0.0.1', port=8080):
             try:
                 query = parse_qs(route.query, max_num_fields=10)
                 if route.path == '/':
-                    self.respond(200, Path(__file__).with_name('static').joinpath('index.html').read_bytes(), 'text/html; charset=utf-8')
+                    html=Path(__file__).with_name('static').joinpath('index.html').read_text()
+                    if auth:
+                        bootstrap=json.dumps(self.user).replace('<','\\u003c')
+                        html=html.replace('<script>','<script>window.spoondevAccount='+bootstrap+';</script><script>',1)
+                    self.respond(200,html.encode(),'text/html; charset=utf-8')
                 elif route.path == '/api/stats':
                     self.respond(200, webdata.stats(database))
                 elif route.path == '/api/on-air':
@@ -49,13 +115,13 @@ def make_server(database, host='127.0.0.1', port=8080):
                     except LiveStatusError as exc:
                         self.respond(503, {'error':str(exc)})
                 elif route.path == '/api/fan-owners':
-                    self.respond(200, webdata.fan_owners(database))
+                    self.respond(200, webdata.fan_owners(database, self.private_db if auth else None))
                 elif route.path == '/api/fans':
                     owner_id = fans.numeric_id(query.get('owner_id', [''])[0])
                     offset = int(query.get('offset', ['0'])[0])
                     if not 0 <= offset <= 1000000:
                         raise ValueError('Invalid offset')
-                    self.respond(200, webdata.fan_destinations(database, owner_id, offset=offset))
+                    self.respond(200, webdata.fan_destinations(database, owner_id, offset=offset, private_database=self.private_db if auth else None))
                 elif route.path == '/fan-export.js':
                     self.respond(200, Path(__file__).with_name('static').joinpath('fan-export.js').read_bytes(), 'text/javascript; charset=utf-8')
                 elif route.path == '/api/favorites/activity':
@@ -107,27 +173,50 @@ def make_server(database, host='127.0.0.1', port=8080):
                 self.respond(503, {'error':'データを読み込めませんでした。時間をおいて再試行してください。'})
 
         def do_POST(self):
-            if urlsplit(self.path).path != '/api/fans/import':
-                self.respond(405, {'error':'この操作は利用できません。'})
-                return
-            # JSON plus browser-origin checks protect LAN writes from cross-site requests.
+            path=urlsplit(self.path).path
+            if path not in ('/api/fans/import','/api/login','/api/logout','/api/favorites') or (not auth and path!='/api/fans/import'):
+                self.respond(405,{'error':'この操作は利用できません。'}); return
+            if path!='/api/login' and not self.gate(): return
             origin=self.headers.get('Origin')
-            if (origin and origin != 'http://'+self.headers.get('Host','')) or self.headers.get('Sec-Fetch-Site')=='cross-site':
-                self.respond(403, {'error':'このサイトから操作してください。'})
-                return
+            expected=public_url or 'http://'+self.headers.get('Host','')
+            if (auth and origin!=expected) or (origin and origin!=expected) or self.headers.get('Sec-Fetch-Site')=='cross-site':
+                self.respond(403,{'error':'このサイトから操作してください。'}); return
+            if auth and path!='/api/login' and not hmac.compare_digest(self.headers.get('X-CSRF-Token',''),self.user['csrf']):
+                self.respond(403,{'error':'ページを再読み込みしてください。'}); return
+            if path=='/api/login':
+                with login_lock:
+                    now=time.monotonic(); attempts[:]=[t for t in attempts if now-t<60]
+                    if len(attempts)>=10:
+                        self.respond(429,{'error':'少し待ってからログインしてください。'}); return
+                    attempts.append(now)
             if self.headers.get('Content-Type','').split(';')[0] != 'application/json':
                 self.respond(415, {'error':'JSON形式の一覧を指定してください。'})
                 return
             try:
                 length=int(self.headers.get('Content-Length','0'))
-                if not 0 < length <= 8*1024*1024:
+                if not 0 < length <= (8192 if path=='/api/login' else 8*1024*1024):
                     self.respond(413, {'error':'一覧は8MB以内に分けて取り込んでください。'})
                     return
                 self.connection.settimeout(15)
                 body=self.rfile.read(length)
                 if len(body)!=length:
                     raise ValueError('一覧の受信が完了していません。')
-                result=fans.import_followers(database,json.loads(body))
+                payload=json.loads(body)
+                if not isinstance(payload,dict): raise ValueError('JSON object required')
+                if path=='/api/login':
+                    token=accounts.login(auth_database,payload.get('username',''),payload.get('password',''))
+                    if not token:
+                        self.respond(401,{'error':'ユーザー名かパスワードを確認してください。'}); return
+                    self.respond(200,{'ok':True},headers={'Set-Cookie':'spoondev_session='+token+'; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800'+('; Secure' if public_url else '')}); return
+                if path=='/api/logout':
+                    accounts.logout(auth_database,self.token)
+                    self.respond(200,{'ok':True},headers={'Set-Cookie':'spoondev_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'+('; Secure' if public_url else '')}); return
+                if path=='/api/favorites':
+                    result=accounts.favorites(self.private_db,payload)
+                    if result is None:
+                        self.respond(409,{'error':'別の画面で更新されました。再読み込みしてください。'}); return
+                else:
+                    result=fans.import_followers(self.private_db if auth else database,payload)
                 self.respond(200,result)
             except (ValueError,UnicodeError) as exc:
                 self.respond(400, {'error':str(exc)})
@@ -137,13 +226,13 @@ def make_server(database, host='127.0.0.1', port=8080):
         def log_message(self, *_):
             pass
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = LimitedServer((host, port), Handler)
     server.daemon_threads = True
     return server
 
 
-def serve(database, host='127.0.0.1', port=8080):
-    server = make_server(database,host,port)
+def serve(database, host='127.0.0.1', port=8080, **options):
+    server = make_server(database,host,port,**options)
     print(f'Search website listening on {host}, port {server.server_port}', flush=True)
     try:
         server.serve_forever()

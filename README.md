@@ -125,3 +125,25 @@ Spoonの公式ブラウザではフォロワー一覧は本人のみ表示でき
 詳細画面のユーザー名（↗）を押すと、その数値IDのSpoonプロフィールを開きます。PCでは別タブ、スマホではアプリを優先します。
 
 スマホの名前リンクはAndroidで公式スキーム `spooncast://deeplink/user?user_id=ID&country=jp` と公式パッケージ `co.spoonme` のIntent、iPhone/iPadで公式OneLink `https://spoon.onelink.me/Uuzo` を使用します。未インストール時のブラウザURLを指定し、直接「ブラウザで開く」リンクも用意しています。インストール状態をWebから判別しているわけではなく、起動可否はOS・ブラウザ・Spoonアプリの設定に依存します。実機でのアプリ受け渡しはクラウドでは検証できません。
+
+### Macから無料の一時URLで公開・ログイン
+
+Python 3.12の `spoondev` 環境を使います。既存の `serve` のターミナルだけ Ctrl+C で停止し、収集処理は動かしたままで構いません。
+
+```bash
+conda activate spoondev
+cd ~/SpoonDev
+git pull --ff-only
+python -m pip install -e .
+brew install cloudflared
+python -m spoondev create-user kitomoya --claim-local-data
+bash scripts/start-public-mac.sh
+```
+
+パスワードはMacのターミナルで2回入力します（12文字以上・入力中は表示されません）。表示された `https://…trycloudflare.com` をスマホやPCで開き、作成したユーザー名とパスワードでログインしてください。ルーターのポート開放は不要です。Macとターミナルを起動したまま使います。スリープ防止はスクリプトに含まれますが、Macの蓋は閉じないでください。URLは起動ごとに変わる試験公開用です。Cloudflare Quick Tunnelの可用性や接続数にはサービス側の制約があります。
+
+追加アカウントは `python -m spoondev create-user alice`。パスワード変更は `python -m spoondev create-user kitomoya --reset`（既存のログインをすべて解除）。一般公開の新規登録はありません。
+
+ログイン版ではお気に入りとファン登録を利用者別のDBに保存します。観測・公開プロフィールデータは共通です。`--claim-local-data` は既存のファン登録を指定アカウントだけにコピーする移行オプションです。ブラウザに保存していたお気に入りは自動移行されないのでログイン後に再登録してください。データは `data/accounts.sqlite3` と `data/account-data/` に保存され、Gitには入りません。これらも観測DBと合わせてバックアップしてください。
+
+外部公開スクリプトは常に認証を有効にして127.0.0.1だけで待ち受けます。通常の `serve` は従来どおりログインなしのローカル利用用です。公開時のCookieはSecure/HttpOnly、変更操作はOriginとCSRFトークンで検証します。これはMacから少人数で試す構成であり、決済・メール・アカウント復旧・常時稼働のSaaS基盤は含みません。

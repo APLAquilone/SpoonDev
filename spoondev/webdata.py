@@ -13,10 +13,14 @@ from .db import broadcaster_listeners, listener_broadcasters, temperature_histor
 
 
 @contextmanager
-def _read(database):
+def _read(database, private_database=None):
     uri = Path(database).resolve().as_uri() + '?mode=ro'
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
+    if private_database:
+        conn.execute('ATTACH DATABASE ? AS private', (Path(private_database).resolve().as_uri()+'?mode=ro',))
+        for table in ('fan_owners','registered_fans'):
+            conn.execute(f'CREATE TEMP VIEW {table} AS SELECT * FROM private.{table}')
     conn.execute('PRAGMA query_only=ON')
     try:
         yield conn
@@ -127,14 +131,14 @@ def favorite_activity(database, user_ids):
     return {'users': users, 'checked_at': now.isoformat(), 'recent_minutes': 30}
 
 
-def fan_owners(database):
-    with _read(database) as conn:
+def fan_owners(database, private_database=None):
+    with _read(database, private_database) as conn:
         return [dict(row) for row in conn.execute('''SELECT o.*,
             (SELECT COUNT(*) FROM registered_fans f WHERE f.owner_id=o.id) AS fan_count
             FROM fan_owners o ORDER BY imported_at DESC,id''')]
 
 
-def fan_destinations(database, owner_id, offset=0, limit=50):
+def fan_destinations(database, owner_id, offset=0, limit=50, private_database=None):
     """Join an owner's imported fans with current-month rankings and recent live sightings."""
     from .fans import numeric_id
     owner_id=numeric_id(owner_id)
@@ -143,7 +147,7 @@ def fan_destinations(database, owner_id, offset=0, limit=50):
     now=datetime.now(timezone.utc)
     month=now.astimezone(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m')
     cutoff=(now-timedelta(minutes=30)).isoformat(timespec='microseconds')
-    with _read(database) as conn:
+    with _read(database, private_database) as conn:
         owner=conn.execute('SELECT * FROM fan_owners WHERE id=?',(owner_id,)).fetchone()
         if owner is None:
             return {'owner':None,'fans':[],'has_more':False,'total':0,'month':month}
