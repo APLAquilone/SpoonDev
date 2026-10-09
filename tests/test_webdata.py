@@ -23,6 +23,18 @@ class WebDataTests(unittest.TestCase):
         self.assertFalse(result['has_more'])
         self.assertEqual([r['id'] for r in search_users(self.path,'20')['users']],['200','201'])
 
+    def test_cached_profile_tag_and_timestamp_are_not_swapped(self):
+        from spoondev import profiledb
+        profiledb.initialize(self.path)
+        profiledb.cache_users(self.path,[{'id':'999','name':'cached','tag':'cached-tag'}],
+                              '2026-10-10T00:00:00Z')
+        result=search_users(self.path,'cached-tag')['users'][0]
+        self.assertEqual(result['tag'],'cached-tag')
+        self.assertEqual(result['last_seen_at'],'2026-10-10T00:00:00.000000+00:00')
+        detail=user_details(self.path,'999')
+        self.assertEqual(detail['tag'],'cached-tag')
+        self.assertEqual(detail['last_seen_at'],result['last_seen_at'])
+
     def test_literal_wildcards_and_injection(self):
         for q in ('%','_','\\'):
             self.assertEqual([r['id'] for r in search_users(self.path,q)['users']],['201'])

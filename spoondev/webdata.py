@@ -39,7 +39,8 @@ def _profiles(conn):
         return _PROFILE
     return f'''SELECT id,name,tag,last_seen_at FROM (
       SELECT id,name,tag,last_seen_at,ROW_NUMBER() OVER(PARTITION BY id ORDER BY last_seen_at DESC) AS rn
-      FROM ({_PROFILE} UNION ALL SELECT id,name,tag,updated_at AS last_seen_at FROM profile_users)
+      FROM (SELECT id,name,tag,last_seen_at FROM ({_PROFILE})
+            UNION ALL SELECT id,name,tag,updated_at AS last_seen_at FROM profile_users)
     ) WHERE rn=1'''
 
 
