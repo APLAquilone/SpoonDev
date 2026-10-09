@@ -59,6 +59,17 @@ class FanTests(unittest.TestCase):
         self.assertEqual(self.db.read_bytes(),before)
         self.assertEqual(webdata.fan_destinations(self.db,'999')['owner'],None)
 
+    def test_recent_fans_are_sorted_before_pagination(self):
+        self.put([str(i) for i in range(100,155)],True)
+        now=datetime.now(timezone.utc)
+        save_snapshot(self.db,{'room_id':'r','broadcaster':{'id':'10','name':'own'},
+            'listeners':[{'id':'154','name':'recent'}],'complete':True,
+            'observed_at':(now-timedelta(minutes=5)).isoformat()})
+        result=webdata.fan_destinations(self.db,'10')
+        self.assertEqual(result['fans'][0]['id'],'154')
+        self.assertTrue(result['fans'][0]['recent'])
+        self.assertFalse(result['fans'][1]['recent'])
+
     def test_pagination_and_max_five_destinations(self):
         self.put([str(i) for i in range(100,155)],True)
         first=webdata.fan_destinations(self.db,'10');last=webdata.fan_destinations(self.db,'10',offset=50)

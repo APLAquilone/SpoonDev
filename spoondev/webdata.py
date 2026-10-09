@@ -148,10 +148,17 @@ def fan_destinations(database, owner_id, offset=0, limit=50):
         if owner is None:
             return {'owner':None,'fans':[],'has_more':False,'total':0,'month':month}
         total=conn.execute('SELECT COUNT(*) FROM registered_fans WHERE owner_id=?',(owner_id,)).fetchone()[0]
-        rows=conn.execute(f'''WITH profiles AS ({_profiles(conn)})
+        rows=conn.execute(f'''WITH profiles AS ({_profiles(conn)}), activity AS (
+          SELECT m.listener_id,MAX(s.observed_at) AS last_live_at FROM registered_fans f
+          JOIN memberships m ON m.listener_id=f.user_id JOIN snapshots s ON s.id=m.snapshot_id
+          WHERE f.owner_id=? AND s.observed_at<=? GROUP BY m.listener_id)
           SELECT f.user_id AS id,COALESCE(p.name,f.name,'名前未取得') AS name,
-          COALESCE(p.tag,f.tag) AS tag FROM registered_fans f LEFT JOIN profiles p ON p.id=f.user_id
-          WHERE f.owner_id=? ORDER BY f.user_id LIMIT ? OFFSET ?''',(owner_id,limit+1,offset)).fetchall()
+          COALESCE(p.tag,f.tag) AS tag,a.last_live_at,
+          COALESCE(a.last_live_at>=?,0) AS recent FROM registered_fans f
+          LEFT JOIN profiles p ON p.id=f.user_id LEFT JOIN activity a ON a.listener_id=f.user_id
+          WHERE f.owner_id=? ORDER BY recent DESC,
+          CASE WHEN a.last_live_at>=? THEN a.last_live_at END DESC,f.user_id LIMIT ? OFFSET ?''',
+          (owner_id,now.isoformat(timespec='microseconds'),cutoff,owner_id,cutoff,limit+1,offset)).fetchall()
         users=[dict(row,monthly=[],live=[]) for row in rows[:limit]]
         indexed=conn.execute('SELECT COUNT(DISTINCT dj_id),MAX(observed_at) FROM monthly_dj_snapshots WHERE month=?',(month,)).fetchone()
         if users:
