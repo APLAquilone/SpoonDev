@@ -42,6 +42,12 @@ def make_server(database, host='127.0.0.1', port=8080):
                     self.respond(200, Path(__file__).with_name('static').joinpath('index.html').read_bytes(), 'text/html; charset=utf-8')
                 elif route.path == '/api/stats':
                     self.respond(200, webdata.stats(database))
+                elif route.path == '/api/on-air':
+                    from .onair import current_public_lives, LiveStatusError
+                    try:
+                        self.respond(200, current_public_lives())
+                    except LiveStatusError as exc:
+                        self.respond(503, {'error':str(exc)})
                 elif route.path == '/api/fan-owners':
                     self.respond(200, webdata.fan_owners(database))
                 elif route.path == '/api/fans':

@@ -43,6 +43,14 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.get('/api/users/2')['broadcasters'][0]['user_id'],'1')
         self.assertEqual(self.get('/api/history?broadcaster_id=1&listener_id=2')[0]['favorite_temperature'],42)
 
+    def test_on_air_endpoint(self):
+        with patch('spoondev.onair.current_public_lives',return_value={'users':[{'user_id':'1','room_id':'room'}],'checked_at':'2026-10-09T00:00:00Z'}):
+            self.assertEqual(self.get('/api/on-air')['users'][0]['user_id'],'1')
+        from spoondev.onair import LiveStatusError
+        with patch('spoondev.onair.current_public_lives',side_effect=LiveStatusError('Unavailable')):
+            with self.assertRaises(HTTPError) as error:self.get('/api/on-air')
+            self.assertEqual(error.exception.code,503)
+
     def test_fan_import_and_cross_origin_protection(self):
         body=json.dumps({'owner':{'id':'1','name':'Host'},'followers':['2','99'],'complete':True}).encode()
         url=self.base+'/api/fans/import'
