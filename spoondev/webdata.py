@@ -6,7 +6,7 @@ error and can never silently become an empty database.
 from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from . import profiledb
 from .db import broadcaster_listeners, listener_broadcasters, temperature_history
@@ -97,3 +97,31 @@ def stats(database):
 def history(database, broadcaster, listener):
     with _read(database) as conn:
         return temperature_history(conn,broadcaster,listener)
+
+
+def favorite_activity(database, user_ids):
+    # Last listener observation, independent of profile/monthly refresh times.
+    if not isinstance(user_ids, list) or len(user_ids) > 100 or any(
+        not isinstance(user_id, str) or not user_id.isascii() or not user_id.isdigit()
+        or len(user_id) > 200 for user_id in user_ids
+    ):
+        raise ValueError('At most 100 numeric account IDs required')
+    user_ids = list(dict.fromkeys(user_ids))
+    now = datetime.now(timezone.utc)
+    observed = {}
+    if user_ids:
+        with _read(database) as conn:
+            placeholders = ','.join('?' for _ in user_ids)
+            rows = conn.execute(f'''SELECT m.listener_id AS id,MAX(s.observed_at) AS last_live_at
+                FROM memberships m JOIN snapshots s ON s.id=m.snapshot_id
+                WHERE m.listener_id IN ({placeholders}) GROUP BY m.listener_id''', user_ids).fetchall()
+            observed = {row['id']: row['last_live_at'] for row in rows}
+    users = []
+    for user_id in user_ids:
+        value = observed.get(user_id)
+        recent = False
+        if value:
+            seen = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            recent = now - timedelta(minutes=30) <= seen <= now
+        users.append({'id': user_id, 'last_live_at': value, 'recent': recent})
+    return {'users': users, 'checked_at': now.isoformat(), 'recent_minutes': 30}

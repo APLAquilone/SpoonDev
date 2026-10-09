@@ -2,6 +2,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone, timedelta
 from spoondev.db import initialize, save_snapshot
 from spoondev.webdata import search_users, user_details, stats, history
 
@@ -67,6 +68,35 @@ class WebDataTests(unittest.TestCase):
         self.assertEqual(stats(self.path),{'user_count':3,'snapshot_count':1,'last_observed_at':'2026-10-09T00:00:00.000000+00:00','monthly_indexed_djs':0})
         self.assertEqual(history(self.path,'100','200')[0]['favorite_temperature'],46)
         self.assertEqual(history(self.path,'other','200'),[])
+
+    def test_favorite_activity_only_uses_listener_observations(self):
+        from spoondev.webdata import favorite_activity
+        from spoondev import profiledb
+        now = datetime.now(timezone.utc)
+        self.payload['observed_at'] = (now-timedelta(minutes=5)).isoformat()
+        self.payload['complete'] = False  # A positively observed listener still counts.
+        self.payload['listeners'] = [{'id':'200','name':'recent'}]
+        save_snapshot(self.path,self.payload)
+        self.payload['observed_at'] = (now-timedelta(minutes=40)).isoformat()
+        self.payload['listeners'] = [{'id':'201','name':'old'}]
+        save_snapshot(self.path,self.payload)
+        profiledb.initialize(self.path)
+        profiledb.cache_users(self.path,[{'id':'201','name':'refreshed-profile'},
+                                       {'id':'999','name':'monthly-only'}],now.isoformat())
+        before = self.path.read_bytes()
+        result = favorite_activity(self.path,['200','201','100','999','404','200'])
+        users = {row['id']:row for row in result['users']}
+        self.assertTrue(users['200']['recent'])
+        self.assertFalse(users['201']['recent'])
+        self.assertIsNotNone(users['201']['last_live_at'])
+        for user_id in ('100','999','404'):
+            self.assertFalse(users[user_id]['recent'])
+            self.assertIsNone(users[user_id]['last_live_at'])
+        self.assertEqual(len(result['users']),5)
+        self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(favorite_activity(self.path,[])['users'],[])
+        for invalid in (['bad'],['1']*101,['1 OR 1=1'],[1]):
+            with self.assertRaises(ValueError): favorite_activity(self.path,invalid)
 
     def test_missing_database_never_created(self):
         missing=Path(self.temp.name)/'missing.sqlite'

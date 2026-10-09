@@ -43,6 +43,17 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.get('/api/users/2')['broadcasters'][0]['user_id'],'1')
         self.assertEqual(self.get('/api/history?broadcaster_id=1&listener_id=2')[0]['favorite_temperature'],42)
 
+    def test_favorite_activity_api(self):
+        result=self.get('/api/favorites/activity?ids=1,2,99')
+        users={row['id']:row for row in result['users']}
+        self.assertIsNone(users['1']['last_live_at'])
+        self.assertEqual(users['2']['last_live_at'],'2026-10-09T00:00:00.000000+00:00')
+        self.assertIsNone(users['99']['last_live_at'])
+        self.assertEqual(result['recent_minutes'],30)
+        with self.assertRaises(HTTPError) as error:
+            self.get('/api/favorites/activity?ids=invalid')
+        self.assertEqual(error.exception.code,400)
+
     def test_html_and_readonly_boundaries(self):
         with urlopen(self.base,timeout=5) as response:
             self.assertIn('text/html',response.headers['Content-Type'])

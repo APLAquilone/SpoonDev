@@ -40,6 +40,9 @@ def make_server(database, host='127.0.0.1', port=8080):
                     self.respond(200, Path(__file__).with_name('static').joinpath('index.html').read_bytes(), 'text/html; charset=utf-8')
                 elif route.path == '/api/stats':
                     self.respond(200, webdata.stats(database))
+                elif route.path == '/api/favorites/activity':
+                    ids = query.get('ids', [''])[0]
+                    self.respond(200, webdata.favorite_activity(database, ids.split(',') if ids else []))
                 elif route.path == '/api/users':
                     term = query.get('q',[''])[0].strip()
                     offset = int(query.get('offset',['0'])[0])
