@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from spoondev import accounts, collection_status, db, fans, gifts, profiledb, worker
+from spoondev import accounts, collection_status, db, fans, gifts, profiledb, supervisor, worker
 from spoondev.collector import FetchError
 from spoondev.spoon import SpoonRateLimit
 
@@ -179,6 +179,127 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(worker._claim(self.database)['dj_id'], '20')
         self.assertEqual(worker._claim(self.database)['dj_id'], '10')
         self.assertIsNone(worker._claim(self.database))
+
+    def test_due_live_scan_precedes_aged_ranking_backlog(self):
+        worker.enqueue(self.database,'monthly','10',priority=100)
+        worker.enqueue(self.database,'gifts','20',priority=10)
+        worker.enqueue(self.database,'live',priority=90)
+        with sqlite3.connect(self.database) as conn:
+            # A ranking backlog older than one day used to outrank a new live
+            # deadline even at its lowest priority, repeatedly delaying scans.
+            conn.execute("UPDATE worker_jobs SET due_at=? WHERE kind='gifts'",(time.time()-24*3600,))
+        self.assertEqual(worker._claim(self.database)['kind'],'live')
+        # Keep fairness for ranking jobs while the live scan is in flight.
+        self.assertEqual(worker._claim(self.database)['dj_id'],'20')
+        self.assertEqual(worker._claim(self.database)['dj_id'],'10')
+        self.assertIsNone(worker._claim(self.database))
+
+    def test_reserved_live_slot_does_not_start_rankings_or_override_deadlines(self):
+        worker.enqueue(self.database,'monthly','10',priority=100)
+        self.assertIsNone(worker._claim(self.database,live_only=True))
+        worker.enqueue(self.database,'live',priority=90)
+        with sqlite3.connect(self.database) as conn:
+            conn.execute("UPDATE worker_jobs SET state='completed',due_at=? WHERE kind='live'",(time.time()+300,))
+        self.assertIsNone(worker._claim(self.database,live_only=True))
+        with sqlite3.connect(self.database) as conn:
+            conn.execute("UPDATE worker_jobs SET due_at=? WHERE kind='live'",(time.time()-1,))
+        self.assertEqual(worker._claim(self.database,live_only=True)['kind'],'live')
+        self.assertIsNone(worker._claim(self.database,live_only=True))
+        self.assertEqual(worker._claim(self.database)['kind'],'monthly')
+
+    def test_discovery_input_failure_still_queues_listener_scan(self):
+        with patch('spoondev.worker._account_inputs',side_effect=sqlite3.OperationalError('no such table: accounts')):
+            with self.assertRaises(sqlite3.OperationalError):worker._discover(self.database,self.auth)
+        rows=self.jobs()
+        self.assertEqual([(row['kind'],row['state']) for row in rows],[('live','queued')])
+        self.assertEqual(worker._claim(self.database)['kind'],'live')
+
+    def test_failed_discovery_preserves_existing_live_deadline_and_rankings(self):
+        worker._discover(self.database,self.auth)
+        deadline=time.time()+300
+        with sqlite3.connect(self.database) as conn:
+            conn.execute("UPDATE worker_jobs SET due_at=?,state='completed' WHERE kind='live'",(deadline,))
+        before=self.jobs()
+        with patch('spoondev.worker._account_inputs',side_effect=PermissionError(13,'denied','/private/account-data')):
+            with self.assertRaises(PermissionError):worker._discover(self.database,self.auth)
+        self.assertEqual(self.jobs(),before)
+        self.assertIsNone(worker._claim(self.database,live_only=True))
+
+    def test_discovery_errors_report_safe_causes_without_private_values(self):
+        cases=(
+            (sqlite3.OperationalError('database is locked'),'database is locked'),
+            (sqlite3.OperationalError('interrupted'),'interrupted'),
+            (sqlite3.OperationalError('no such table: private_secret_table'),'Required database table is missing'),
+            (sqlite3.OperationalError('private_secret_token'),'SQLite operation failed'),
+            (PermissionError(13,'private_secret_token','/private_secret_path'),'OS error 13'),
+            (ValueError('private_secret_token'),'Account discovery data could not be read'),
+            (ValueError('Create an account before starting automatic collection'),'No collection accounts are configured'),
+        )
+        for error,cause in cases:
+            with self.subTest(error=error):
+                message=worker._discovery_error_message(error)
+                self.assertIn(type(error).__name__,message)
+                self.assertIn(cause,message)
+                self.assertNotIn('private_secret',message)
+
+    def test_discovery_write_lock_respects_remaining_time_budget(self):
+        blocker=sqlite3.connect(self.database)
+        self.addCleanup(blocker.close)
+        blocker.execute('BEGIN IMMEDIATE')
+        started=time.monotonic()
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                worker._discover(self.database,self.auth,deadline=started+.05)
+            self.assertLess(time.monotonic()-started,.5)
+        finally:blocker.rollback()
+        self.assertEqual(self.jobs(),[])
+
+    def test_discovery_write_cancellation_rolls_back_target_changes(self):
+        worker._discover(self.database,self.auth)
+        before=self.jobs()
+        stop=threading.Event()
+        with self.assertRaisesRegex(sqlite3.OperationalError,'discovery cancelled'):
+            with worker._discovery_write(self.database,stop_event=stop) as conn:
+                conn.execute("UPDATE worker_jobs SET priority=10 WHERE kind!='live'")
+                stop.set()
+        self.assertEqual(self.jobs(),before)
+
+    def test_discovery_write_expired_budget_rolls_back_target_changes(self):
+        worker._discover(self.database,self.auth)
+        before=self.jobs()
+        with self.assertRaisesRegex(sqlite3.OperationalError,'time budget exceeded'):
+            with worker._discovery_write(self.database,deadline=time.monotonic()+.01) as conn:
+                conn.execute("UPDATE worker_jobs SET priority=10 WHERE kind!='live'")
+                time.sleep(.02)
+        self.assertEqual(self.jobs(),before)
+
+    def test_cancelled_discovery_does_not_enqueue_or_reset_work(self):
+        worker._discover(self.database,self.auth)
+        before=self.jobs()
+        stop=threading.Event();stop.set()
+        with self.assertRaisesRegex(sqlite3.OperationalError,'discovery cancelled'):
+            worker._discover(self.database,self.auth,stop_event=stop)
+        self.assertEqual(self.jobs(),before)
+
+    def test_worker_startup_validates_auth_without_reading_private_accounts(self):
+        stop=threading.Event()
+        def attempt(*args):
+            stop.set()
+            return {'complete':True}
+        with patch('spoondev.worker._account_inputs',side_effect=AssertionError('Startup read private data')) as private, \
+                patch('spoondev.worker._discover',return_value={}), \
+                patch('spoondev.worker._attempt',side_effect=attempt):
+            result=worker.run(self.database,self.auth,stop_event=stop,concurrency=1)
+        private.assert_not_called()
+        self.assertEqual(result,{'state':'stopped','attempt_count':1})
+
+    def test_supervisor_startup_validates_auth_without_reading_private_accounts(self):
+        with patch('spoondev.worker._account_inputs',side_effect=AssertionError('Startup read private data')) as private, \
+                patch('spoondev.supervisor.run',return_value={'state':'stopped'}) as run:
+            result=supervisor.main(['--db',str(self.database),'--auth-db',str(self.auth)])
+        private.assert_not_called()
+        run.assert_called_once()
+        self.assertEqual(result,0)
 
     def test_global_429_cooldown_persists_and_blocks_other_jobs(self):
         stop = threading.Event()
@@ -374,12 +495,15 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(dest.exists())
 
     def test_unhandled_task_failure_does_not_stop_other_collection_jobs(self):
-        stop=threading.Event();original=worker._attempt
+        stop=threading.Event();original=worker._attempt;observed=set()
         def attempt(database,job,*args):
-            if job['kind']=='gifts':raise RuntimeError('Unexpected task crash')
-            return original(database,job,*args)
+            try:
+                if job['kind']=='gifts':raise RuntimeError('Unexpected task crash')
+                return original(database,job,*args)
+            finally:
+                observed.add(job['kind'])
+                if len(observed)==3:stop.set()
         def live(**kwargs):
-            stop.set()
             return [],[]
         with patch('spoondev.worker._attempt',side_effect=attempt), \
                 patch('spoondev.worker.collect_monthly',return_value={'complete':True,'dj_count':1,'errors':[]}), \

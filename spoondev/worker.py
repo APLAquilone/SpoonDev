@@ -30,6 +30,7 @@ from . import collection_status
 REQUEST_SPACING = 0.4
 REQUESTS_PER_MINUTE = 60
 DISCOVERY_INTERVAL = 60
+DISCOVERY_QUERY_SECONDS = 30
 HEARTBEAT_INTERVAL = 5
 HEARTBEAT_FRESH_SECONDS = 30
 
@@ -84,11 +85,51 @@ def _table(conn,name):
 
 
 @contextmanager
-def _readonly(path):
-    conn=sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True,timeout=5)
-    conn.execute('PRAGMA query_only=ON')
-    try:yield conn
+def _readonly(path, *, stop_event=None, deadline=None):
+    _check_discovery_budget(stop_event,deadline)
+    timeout=5 if deadline is None else min(5,max(0,deadline-time.monotonic()))
+    conn=sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True,timeout=timeout)
+    try:
+        if stop_event is not None or deadline is not None:
+            conn.set_progress_handler(lambda: int(
+                (stop_event is not None and stop_event.is_set()) or
+                (deadline is not None and time.monotonic()>=deadline)),1000)
+        conn.execute('PRAGMA query_only=ON')
+        yield conn
     finally:conn.close()
+
+
+def _check_discovery_budget(stop_event,deadline):
+    if stop_event is not None and stop_event.is_set():
+        raise sqlite3.OperationalError('discovery cancelled')
+    if deadline is not None and time.monotonic()>=deadline:
+        raise sqlite3.OperationalError('discovery query time budget exceeded')
+
+
+@contextmanager
+def _discovery_write(database, *, stop_event=None, deadline=None):
+    """Bound discovery writes and roll back an expired target refresh."""
+    _check_discovery_budget(stop_event,deadline)
+    timeout=1 if deadline is None else min(1,max(0,deadline-time.monotonic()))
+    conn=sqlite3.connect(database,timeout=timeout)
+    try:
+        if stop_event is not None or deadline is not None:
+            conn.set_progress_handler(lambda: int(
+                (stop_event is not None and stop_event.is_set()) or
+                (deadline is not None and time.monotonic()>=deadline)),1000)
+        with conn:
+            yield conn
+            _check_discovery_budget(stop_event,deadline)
+            # A read lock may delay commit after the write itself succeeds.
+            # Recompute the remaining timeout rather than reusing its value
+            # from connection creation near the end of this time budget.
+            if deadline is not None:
+                milliseconds=int(1000*min(1,max(0,deadline-time.monotonic())))
+                conn.execute(f'PRAGMA busy_timeout={milliseconds}')
+                _check_discovery_budget(stop_event,deadline)
+    finally:
+        conn.set_progress_handler(None,0)
+        conn.close()
 
 
 def _target(kind,dj_id):
@@ -177,28 +218,44 @@ def _lease(database):
         os.close(fd)
 
 
-def _account_inputs(auth_database):
-    """Read current accounts only; retained files for deleted accounts are ignored."""
-    with _readonly(auth_database) as conn:
+def _account_ids(auth_database, *, stop_event=None, deadline=None):
+    """Validate the account registry without reading any private databases."""
+    with _readonly(auth_database,stop_event=stop_event,deadline=deadline) as conn:
         ids=[r[0] for r in conn.execute('SELECT id FROM accounts')]
     if not ids:raise ValueError('Create an account before starting automatic collection')
+    return ids
+
+
+def _account_inputs(auth_database, *, stop_event=None, deadline=None, warnings=None):
+    """Read current accounts only; retained files for deleted accounts are ignored."""
+    ids=_account_ids(auth_database,stop_event=stop_event,deadline=deadline)
     owners=set(); saved=set()
     def add_numeric(target,rows):
         for raw in rows:
             try:target.add(numeric_id(raw))
             except ValueError:continue # Legacy adapter IDs are not Spoon IDs.
     for uid in ids:
+        _check_discovery_budget(stop_event,deadline)
         if not isinstance(uid,str) or not re.fullmatch('[0-9a-f]{32}',uid):continue
         path=Path(auth_database).resolve().parent/'account-data'/uid/'private.sqlite3'
         if not path.is_file():continue
-        with _readonly(path) as conn:
-            if _table(conn,'account_settings'):
-                row=conn.execute('SELECT spoon_id FROM account_settings WHERE singleton=1').fetchone()
-                if row and row[0]:add_numeric(owners,[row[0]])
-            if _table(conn,'favorites'):
-                add_numeric(saved,(r[0] for r in conn.execute('SELECT id FROM favorites')))
-            if _table(conn,'registered_fans'):
-                add_numeric(saved,(r[0] for r in conn.execute('SELECT user_id FROM registered_fans')))
+        try:
+            # A damaged or legacy private DB must not stop public room scans.
+            # Keep each account atomic so a failed read contributes no partial
+            # priority hints; no migrations or private writes happen here.
+            account_owners=set();account_saved=set()
+            with _readonly(path,stop_event=stop_event,deadline=deadline) as conn:
+                if _table(conn,'account_settings'):
+                    row=conn.execute('SELECT spoon_id FROM account_settings WHERE singleton=1').fetchone()
+                    if row and row[0]:add_numeric(account_owners,[row[0]])
+                if _table(conn,'favorites'):
+                    add_numeric(account_saved,(r[0] for r in conn.execute('SELECT id FROM favorites')))
+                if _table(conn,'registered_fans'):
+                    add_numeric(account_saved,(r[0] for r in conn.execute('SELECT user_id FROM registered_fans')))
+            owners.update(account_owners);saved.update(account_saved)
+        except (OSError,ValueError,sqlite3.Error) as exc:
+            _check_discovery_budget(stop_event,deadline)
+            if warnings is not None:warnings.append(_discovery_error_message(exc))
     return owners,saved
 
 
@@ -206,27 +263,44 @@ def _appearances(conn,users,now):
     result=set(); users=list(users)
     cutoff=_iso(now-30*86400);asof=_iso(now)
     month=datetime.fromtimestamp(now,timezone.utc).astimezone(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m')
+    monthly=bool(users) and _table(conn,'monthly_dj_snapshots')
     for offset in range(0,len(users),400):
         batch=users[offset:offset+400]; placeholders=','.join('?' for _ in batch)
         rows=conn.execute(f'''SELECT DISTINCT s.broadcaster_id FROM memberships m
           JOIN snapshots s ON s.id=m.snapshot_id WHERE m.listener_id IN ({placeholders})
           AND s.observed_at>=? AND s.observed_at<=?''',[*batch,cutoff,asof]).fetchall()
         result.update(r[0] for r in rows)
-        if _table(conn,'monthly_dj_snapshots'):
-            rows=conn.execute(f'''SELECT DISTINCT s.dj_id FROM monthly_dj_listeners l
-              JOIN monthly_dj_snapshots s ON s.id=l.snapshot_id
-              WHERE l.listener_id IN ({placeholders}) AND s.month=? AND s.observed_at<=? AND s.id=(
-                SELECT other.id FROM monthly_dj_snapshots other WHERE other.dj_id=s.dj_id
-                AND other.month=s.month AND other.observed_at<=? ORDER BY other.observed_at DESC,other.id DESC LIMIT 1)''',
-                [*batch,month,asof,asof]).fetchall()
+        if monthly:
+            # Select each DJ's current ranking first. Starting with a listener's
+            # historical entries repeated the latest-snapshot lookup for every
+            # archived entry and could block discovery as rankings accumulated.
+            # Existing indexes seek the latest snapshot and its member directly;
+            # empty/partial replacements and same-time ID ties retain their
+            # original meaning, without consulting a future observation.
+            rows=conn.execute(f'''SELECT d.dj_id FROM (
+              SELECT DISTINCT dj_id FROM monthly_dj_snapshots
+              WHERE month=? AND observed_at<=?) d WHERE EXISTS (
+                SELECT 1 FROM monthly_dj_listeners l WHERE l.snapshot_id=(
+                  SELECT s.id FROM monthly_dj_snapshots s
+                  WHERE s.dj_id=d.dj_id AND s.month=? AND s.observed_at<=?
+                  ORDER BY s.observed_at DESC,s.id DESC LIMIT 1)
+                AND l.listener_id IN ({placeholders}))''',
+                [month,asof,month,asof,*batch]).fetchall()
             result.update(r[0] for r in rows)
     return result
 
 
-def _discover(database,auth_database):
-    owners,saved=_account_inputs(auth_database)
-    now=time.time(); recent=set()
-    with _readonly(database) as conn:
+def _discover(database,auth_database, *, stop_event=None, deadline=None):
+    now=time.time()
+    # Live collection needs no account-private inputs. Save its queue entry
+    # before reading them so an unavailable private DB cannot stop listener
+    # observations. Re-enqueueing preserves an existing deadline/state.
+    with _discovery_write(database,stop_event=stop_event,deadline=deadline) as conn:
+        _enqueue(conn,'live','',90,now)
+    warnings=[]
+    owners,saved=_account_inputs(auth_database,stop_event=stop_event,deadline=deadline,warnings=warnings)
+    recent=set()
+    with _readonly(database,stop_event=stop_event,deadline=deadline) as conn:
         for owner in owners:
             recent.update(r[0] for r in conn.execute('''SELECT DISTINCT m.listener_id FROM snapshots s
               JOIN memberships m ON m.snapshot_id=s.id WHERE s.broadcaster_id=? AND s.observed_at>=? AND s.observed_at<=?''',
@@ -240,15 +314,40 @@ def _discover(database,auth_database):
             try:uid=numeric_id(raw)
             except ValueError:continue
             targets[uid]=max(priority,targets.get(uid,0))
-    with sqlite3.connect(database,timeout=30) as conn:
+    _check_discovery_budget(stop_event,deadline)
+    with _discovery_write(database,stop_event=stop_event,deadline=deadline) as conn:
         # Public targets may remain useful after an account is deleted or its
         # binding changes. Recompute their current importance, preserving the
         # saved deadline and in-flight state instead of keeping old own-DJ 100.
         conn.execute("UPDATE worker_jobs SET priority=10 WHERE kind IN ('monthly','gifts')")
-        _enqueue(conn,'live','',90,now)
         for uid,priority in targets.items():
             for kind in ('monthly','gifts'):_enqueue(conn,kind,uid,priority,now)
-    return {'bound_dj_count':len(owners),'target_dj_count':len(targets)}
+    result={'bound_dj_count':len(owners),'target_dj_count':len(targets)}
+    if warnings:result['warnings']=list(dict.fromkeys(warnings))
+    return result
+
+
+def _discovery_error_message(exc):
+    """Expose the failure cause without copying paths or private DB contents."""
+    reason='Account discovery data could not be read'
+    if isinstance(exc,sqlite3.Error):
+        message=str(exc).strip().lower()
+        causes=('database is locked','database table is locked','disk i/o error',
+                'unable to open database file','database disk image is malformed',
+                'attempt to write a readonly database','interrupted','out of memory',
+                'database or disk is full','file is not a database')
+        reason=next((cause for cause in causes if message.startswith(cause)),
+                    'SQLite operation failed')
+        if message.startswith('discovery query time budget exceeded'):reason='Discovery query time budget exceeded'
+        elif message.startswith('discovery cancelled'):reason='Discovery was cancelled'
+        elif message.startswith('no such table:'):reason='Required database table is missing'
+        elif message.startswith('no such column:'):reason='Required database column is missing'
+    elif isinstance(exc,OSError):
+        if isinstance(exc.errno,int):reason=f'OS error {exc.errno}: {os.strerror(exc.errno)}'
+        else:reason='Account discovery file could not be read'
+    elif isinstance(exc,ValueError) and str(exc)=='Create an account before starting automatic collection':
+        reason='No collection accounts are configured'
+    return f'Account discovery failed ({type(exc).__name__}): {reason}.'
 
 
 class _Budget:
@@ -308,13 +407,20 @@ def _budgeted_collectors(budget):
         for module,original in originals:module.fetch_snapshot=original
 
 
-def _claim(database):
+def _claim(database,*,live_only=False):
+    """Claim due live work first; ranking aging never overtakes listener scans.
+
+    ``live_only`` lets the scheduler reserve an execution slot for live work
+    while long ranking jobs are already running. It does not reset a deadline
+    or claim a job that another execution owns.
+    """
     now=time.time()
     with sqlite3.connect(database,timeout=30) as conn:
         conn.execute('BEGIN IMMEDIATE')
         row=conn.execute('''SELECT kind,dj_id,priority,failure_count FROM worker_jobs
-          WHERE state!='running' AND due_at<=?
-          ORDER BY priority+MAX(0,(?-due_at)/3600.0)*5 DESC,due_at,kind,dj_id LIMIT 1''',(now,now)).fetchone()
+          WHERE state!='running' AND due_at<=? AND (?=0 OR kind='live')
+          ORDER BY CASE WHEN kind='live' THEN 1 ELSE 0 END DESC,
+          priority+MAX(0,(?-due_at)/3600.0)*5 DESC,due_at,kind,dj_id LIMIT 1''',(now,live_only,now)).fetchone()
         if row is None:return None
         conn.execute("UPDATE worker_jobs SET state='running' WHERE kind=? AND dj_id=?",row[:2])
         return {'kind':row[0],'dj_id':row[1],'priority':row[2],'failure_count':row[3]}
@@ -456,7 +562,7 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
     if type(concurrency) is not int or not 1<=concurrency<=16:raise ValueError('concurrency must be 1..16')
     for value in (live_interval,ranking_interval):
         if type(value) not in (int,float) or not math.isfinite(value) or value<30:raise ValueError('interval must be finite and at least 30 seconds')
-    _account_inputs(auth_database) # Reject a missing/empty auth DB before creating observation files.
+    _account_ids(auth_database) # Reject a missing/empty auth DB before creating observation files.
     initialize_observations(database);initialize(database)
     stop=stop_event if stop_event is not None else threading.Event()
     attempts=0
@@ -479,18 +585,36 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
                     # One busy heartbeat must not terminate all collectors.
                     if failures>=3:stop.set();return
         thread=threading.Thread(target=heartbeat,daemon=True);thread.start()
-        futures={};last_discovery=0;budget=_Budget(database,stop,concurrency)
+        futures={};discovery=None;next_discovery=0;budget=_Budget(database,stop,concurrency)
         try:
+            # Room discovery must remain eligible even if private account data
+            # cannot be read. Target discovery runs separately from collection.
+            with sqlite3.connect(database,timeout=30) as conn:
+                _enqueue(conn,'live','',90,time.time())
             with (_budgeted_collectors(budget),ThreadPoolExecutor(max_workers=concurrency) as pool,
+                  ThreadPoolExecutor(max_workers=1) as discovery_pool,
                   _cancel_on_failure(stop)):
                 while not stop.is_set():
                     now=time.time()
-                    if now-last_discovery>=DISCOVERY_INTERVAL:
-                        try:_discover(database,auth_database)
-                        except (OSError,ValueError,sqlite3.Error):
+                    if discovery is not None and discovery.done():
+                        try:
+                            result=discovery.result()
+                            message=(result.get('warnings') or [None])[0]
+                        except (OSError,ValueError,sqlite3.Error) as exc:
+                            message=_discovery_error_message(exc)
+                        if message is not None:
                             with sqlite3.connect(database,timeout=30) as conn:
-                                conn.execute("UPDATE worker_state SET last_error='Account discovery could not be read.' WHERE singleton=1")
-                        last_discovery=now
+                                conn.execute('UPDATE worker_state SET last_error=? WHERE singleton=1',(message,))
+                        else:
+                            with sqlite3.connect(database,timeout=30) as conn:
+                                conn.execute("""UPDATE worker_state SET last_error=NULL WHERE singleton=1 AND
+                                  (last_error LIKE 'Account discovery could not be read%' OR
+                                   last_error LIKE 'Account discovery failed %')""")
+                        discovery=None
+                        next_discovery=time.monotonic()+DISCOVERY_INTERVAL
+                    if discovery is None and time.monotonic()>=next_discovery:
+                        discovery=discovery_pool.submit(_discover,database,auth_database,
+                            stop_event=stop,deadline=time.monotonic()+DISCOVERY_QUERY_SECONDS)
                     for future in list(futures):
                         if future.done():
                             job=futures.pop(future)
@@ -501,7 +625,11 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
                             attempts+=1
                     if budget.cooldown()<=now:
                         while len(futures)<concurrency and not stop.is_set():
-                            job=_claim(database)
+                            # A long ranking must not occupy every slot while
+                            # the next room sweep is due. Concurrency1 remains
+                            # explicitly serial; larger pools reserve one slot.
+                            rankings=sum(job['kind']!='live' for job in futures.values())
+                            job=_claim(database,live_only=concurrency>1 and rankings>=concurrency-1)
                             if job is None:break
                             interval=live_interval if job['kind']=='live' else ranking_interval
                             future=pool.submit(_attempt,database,job,stop,concurrency,interval)

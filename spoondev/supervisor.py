@@ -113,7 +113,7 @@ def main(argv=None):
         return 0
     # Validate persistent inputs once. A permanent setup mistake should fail
     # visibly instead of producing an endless stream of restart attempts.
-    worker._account_inputs(args.auth_db)
+    worker._account_ids(args.auth_db)
     if not 1<=args.concurrency<=16 or any(not 30<=v<float('inf') for v in (args.live_interval,args.ranking_interval)):
         parser.error('Concurrency must be 1..16 and intervals finite, at least 30 seconds')
     stop=threading.Event()
