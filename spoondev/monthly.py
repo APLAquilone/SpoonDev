@@ -5,6 +5,7 @@ Explicit numeric DJ targets can include profiles never seen broadcasting.
 A ranking entry is a monthly profile relationship, never proof of a current live visit.
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 from itertools import count
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,7 +73,7 @@ def collect_monthly(database,max_djs=100,concurrency=4,max_pages=0,progress_call
             raise ValueError('dj_ids requires a list of numeric IDs')
         targets=list(dict.fromkeys(numeric_id(uid) for uid in dj_ids))
     selection=targets[:max_djs] if explicit and max_djs else targets
-    with sqlite3.connect(Path(database).resolve().as_uri()+'?mode=ro',uri=True) as conn:
+    with closing(sqlite3.connect(Path(database).resolve().as_uri()+'?mode=ro',uri=True)) as conn:
         if explicit:
             # Automatic collection dispatches one DJ at a time. Materializing
             # every known DJ for each such job makes a sweep quadratic.

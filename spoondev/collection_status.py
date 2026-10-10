@@ -1,12 +1,13 @@
 """Persist collection round outcomes; recorded state is not proof of a live process."""
 from datetime import datetime,timezone,timedelta
+from contextlib import closing
 import json,sqlite3
 import math
 
 SCHEMA='''CREATE TABLE IF NOT EXISTS collection_runs(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,target TEXT NOT NULL,started_at TEXT NOT NULL,finished_at TEXT,state TEXT NOT NULL,interval_seconds REAL NOT NULL,details TEXT NOT NULL);CREATE INDEX IF NOT EXISTS collection_runs_latest ON collection_runs(kind,target,id);'''
 
 def begin(database,kind,target='',interval=0):
-    with sqlite3.connect(database,timeout=30) as c:
+    with closing(sqlite3.connect(database,timeout=30)) as c, c:
         c.executescript(SCHEMA)
         return c.execute('INSERT INTO collection_runs(kind,target,started_at,state,interval_seconds,details) VALUES(?,?,?,\'running\',?,\'{}\')',(kind,target,datetime.now(timezone.utc).isoformat(),interval)).lastrowid
 
@@ -22,7 +23,7 @@ def finish(database,run_id,details,failed=False):
                 break
     state=('failed' if failed or (incomplete and successful is False) else
            'partial' if incomplete else 'completed')
-    with sqlite3.connect(database,timeout=30) as c:
+    with closing(sqlite3.connect(database,timeout=30)) as c, c:
         c.execute('UPDATE collection_runs SET finished_at=?,state=?,details=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),state,json.dumps(details,ensure_ascii=False),run_id))
 
 def read(conn):

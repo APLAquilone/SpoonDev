@@ -45,8 +45,8 @@ CREATE INDEX IF NOT EXISTS gift_dj_members_user
 def _connection(database):
     owned = not isinstance(database, sqlite3.Connection)
     conn = sqlite3.connect(database, timeout=30) if owned else database
-    conn.execute('PRAGMA foreign_keys=ON')
     try:
+        conn.execute('PRAGMA foreign_keys=ON')
         yield conn
     finally:
         if owned:

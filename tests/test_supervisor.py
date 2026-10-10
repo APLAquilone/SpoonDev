@@ -1,4 +1,4 @@
-from contextlib import redirect_stdout
+from contextlib import closing,redirect_stdout
 from io import StringIO
 import json
 import os
@@ -68,6 +68,47 @@ class SupervisorTests(unittest.TestCase):
             supervisor.run(self.db,'auth',stop_event=self.stop)
         with sqlite3.connect(self.db) as conn:
             self.assertEqual(conn.execute('SELECT * FROM worker_state').fetchone(),before)
+
+    def test_restart_status_commits_then_closes_each_real_connection_immediately(self):
+        connect=sqlite3.connect
+        cooldown=time.time()+300
+        with closing(connect(self.db)) as conn, conn:
+            conn.execute("UPDATE worker_state SET pid=?,state='stopped',cooldown_until=?",
+                         (os.getpid(),cooldown))
+        # Retain references to simulate delayed cyclic garbage collection.
+        # Correct cleanup must not depend on collection or reference release.
+        opened=[]
+        def tracked_connect(*args,**kwargs):
+            connection=connect(*args,**kwargs)
+            opened.append(connection)
+            return connection
+        with patch('spoondev.supervisor.sqlite3.connect',side_effect=tracked_connect):
+            for _ in range(25):supervisor._mark_restart(self.db,5,'Database reopened')
+        self.assertEqual(len(opened),25)
+        for connection in opened:
+            with self.assertRaisesRegex(sqlite3.ProgrammingError,'closed database'):
+                connection.execute('SELECT 1')
+        with closing(connect(self.db)) as conn:
+            state,restart,error,saved_cooldown=conn.execute(
+                'SELECT state,restart_at,last_error,cooldown_until FROM worker_state').fetchone()
+        self.assertEqual((state,error,saved_cooldown),('restarting','Database reopened',cooldown))
+        self.assertGreater(restart,time.time())
+
+    def test_restart_status_also_closes_connection_when_sql_fails(self):
+        missing_table=self.root/'empty.sqlite3'
+        connect=sqlite3.connect
+        with closing(connect(missing_table)) as conn:
+            conn.execute('CREATE TABLE unrelated(value)')
+        opened=[]
+        def tracked_connect(*args,**kwargs):
+            connection=connect(*args,**kwargs)
+            opened.append(connection)
+            return connection
+        with patch('spoondev.supervisor.sqlite3.connect',side_effect=tracked_connect):
+            supervisor._mark_restart(missing_table,5,'No worker table')
+        self.assertEqual(len(opened),1)
+        with self.assertRaisesRegex(sqlite3.ProgrammingError,'closed database'):
+            opened[0].execute('SELECT 1')
 
     def test_native_service_is_scoped_to_exact_checkout_and_database(self):
         marker=self.root/'data/collector-service.json'

@@ -5,7 +5,7 @@ does not access Spoon login credentials. Queue completion refers to the public
 endpoint's available pages, never all Spoon users or all visits.
 """
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -72,7 +72,7 @@ def initialize(database):
     """Create additive queue/status tables. Does not start a process or fetch data."""
     path=Path(database)
     path.parent.mkdir(parents=True,exist_ok=True)
-    with sqlite3.connect(path,timeout=30) as conn:
+    with closing(sqlite3.connect(path,timeout=30)) as conn, conn:
         conn.executescript(_SCHEMA)
         # Serialize this additive migration with other startup/enqueue calls.
         conn.execute('BEGIN IMMEDIATE')
@@ -156,7 +156,7 @@ def enqueue(database,kind,dj_id=None,priority=50):
     uid=_target(kind,dj_id)
     if type(priority) is not int or not 0<=priority<=100:raise ValueError('priority must be 0..100')
     initialize(database)
-    with sqlite3.connect(database,timeout=30) as conn:
+    with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
         _enqueue(conn,kind,uid,priority,time.time())
 
 
@@ -357,7 +357,7 @@ class _Budget:
         self.slots=threading.BoundedSemaphore(concurrency)
 
     def cooldown(self):
-        with sqlite3.connect(self.database,timeout=30) as conn:
+        with closing(sqlite3.connect(self.database,timeout=30)) as conn, conn:
             return conn.execute('SELECT cooldown_until FROM worker_state WHERE singleton=1').fetchone()[0]
 
     def request(self,url,**kwargs):
@@ -367,7 +367,7 @@ class _Budget:
         try:
             while not self.stop.is_set():
                 now=time.time()
-                with sqlite3.connect(self.database,timeout=30) as conn:
+                with closing(sqlite3.connect(self.database,timeout=30)) as conn, conn:
                     conn.execute('BEGIN IMMEDIATE')
                     cooldown,next_request,window,requests=conn.execute('''SELECT cooldown_until,
                       next_request_at,window_started_at,window_requests FROM worker_state WHERE singleton=1''').fetchone()
@@ -384,7 +384,7 @@ class _Budget:
             if isinstance(result,FetchError) and result.status==429:
                 retry=result.retry_after_seconds
                 delay=retry if type(retry) in (int,float) and math.isfinite(retry) and retry>0 else 60
-                with sqlite3.connect(self.database,timeout=30) as conn:
+                with closing(sqlite3.connect(self.database,timeout=30)) as conn, conn:
                     conn.execute('UPDATE worker_state SET cooldown_until=MAX(cooldown_until,?) WHERE singleton=1',
                                  (time.time()+delay,))
             return result
@@ -415,7 +415,7 @@ def _claim(database,*,live_only=False):
     or claim a job that another execution owns.
     """
     now=time.time()
-    with sqlite3.connect(database,timeout=30) as conn:
+    with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
         conn.execute('BEGIN IMMEDIATE')
         row=conn.execute('''SELECT kind,dj_id,priority,failure_count FROM worker_jobs
           WHERE state!='running' AND due_at<=? AND (?=0 OR kind='live')
@@ -430,7 +430,7 @@ def _attempt(database,job,stop,concurrency,interval):
     kind=job['kind'];uid=job['dj_id'];started=_iso();run_id=None;attempt_id=None
     try:
         run_id=collection_status.begin(database,kind,uid,interval)
-        with sqlite3.connect(database,timeout=30) as conn:
+        with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
             attempt_id=conn.execute('''INSERT INTO worker_attempts(kind,dj_id,started_at,state,run_id)
               VALUES(?,?,?,'running',?)''',(kind,uid,started,run_id)).lastrowid
             conn.execute('UPDATE worker_jobs SET last_attempt_id=? WHERE kind=? AND dj_id=?',(attempt_id,kind,uid))
@@ -472,14 +472,14 @@ def _attempt(database,job,stop,concurrency,interval):
                      'coverage':'listed_public_rooms','snapshot_ids':links}
         summary=dict(summary,restart_policy='restart_from_first_page')
         collection_status.finish(database,run_id,summary)
-        with sqlite3.connect(database,timeout=30) as conn:
+        with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
             state=conn.execute('SELECT state FROM collection_runs WHERE id=?',(run_id,)).fetchone()[0]
         failed=state!='completed'
         failures=job['failure_count']+1 if failed else 0
         retry=summary.get('retry_after',0)
         if type(retry) not in (int,float) or not math.isfinite(retry) or retry<0:retry=0
         delay=max(retry,min(interval,60*2**min(failures-1,6)) if failed else interval)
-        with sqlite3.connect(database,timeout=30) as conn:
+        with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
             conn.execute('''UPDATE worker_attempts SET finished_at=?,state=?,summary=? WHERE id=?''',
                          (_iso(),state,json.dumps(summary,ensure_ascii=False),attempt_id))
             conn.execute('''UPDATE worker_jobs SET state=?,due_at=?,failure_count=? WHERE kind=? AND dj_id=?''',
@@ -493,7 +493,7 @@ def _attempt(database,job,stop,concurrency,interval):
     except Exception as exc:
         summary={'complete':False,'errors':[str(exc)],'restart_policy':'restart_from_first_page'}
         if run_id is not None:collection_status.finish(database,run_id,summary,failed=True)
-        with sqlite3.connect(database,timeout=30) as conn:
+        with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
             if attempt_id is not None:
                 conn.execute('UPDATE worker_attempts SET finished_at=?,state=\'failed\',summary=? WHERE id=?',
                              (_iso(),json.dumps(summary,ensure_ascii=False),attempt_id))
@@ -506,7 +506,7 @@ def _recover(database):
     stamp=_iso()
     details={'complete':False,'errors':['Previous worker ended without a saved result.'],
              'restart_policy':'restart_from_first_page'}
-    with sqlite3.connect(database,timeout=30) as conn:
+    with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
         unfinished=conn.execute("SELECT id,run_id FROM worker_attempts WHERE state='running'").fetchall()
         for attempt_id,_ in unfinished:
             conn.execute('UPDATE worker_attempts SET finished_at=?,state=\'failed\',summary=? WHERE id=?',
@@ -525,7 +525,7 @@ def _record_task_failure(database,job,exc,interval):
     summary={'complete':False,'errors':[f'Collection task failed ({type(exc).__name__}): {exc}'],
              'restart_policy':'restart_from_first_page'}
     run_id=None
-    with sqlite3.connect(database,timeout=30) as conn:
+    with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
         row=conn.execute('''SELECT a.id,a.run_id,a.state FROM worker_jobs j
           LEFT JOIN worker_attempts a ON a.id=j.last_attempt_id
           WHERE j.kind=? AND j.dj_id=?''',(job['kind'],job['dj_id'])).fetchone()
@@ -568,7 +568,7 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
     attempts=0
     with _lease(database) as token:
         _recover(database)
-        with sqlite3.connect(database,timeout=30) as conn:
+        with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
             conn.execute('''UPDATE worker_state SET owner_token=?,pid=?,started_at=?,heartbeat_at=?,
               stopped_at=NULL,state='running',last_error=NULL,restart_at=NULL WHERE singleton=1''',(token,os.getpid(),_iso(),_iso()))
         heartbeat_stop=threading.Event()
@@ -576,7 +576,7 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
             failures=0
             while not heartbeat_stop.wait(HEARTBEAT_INTERVAL):
                 try:
-                    with sqlite3.connect(database,timeout=30) as conn:
+                    with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
                         changed=conn.execute('UPDATE worker_state SET heartbeat_at=? WHERE singleton=1 AND owner_token=?',(_iso(),token)).rowcount
                     if not changed:stop.set();return
                     failures=0
@@ -589,7 +589,7 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
         try:
             # Room discovery must remain eligible even if private account data
             # cannot be read. Target discovery runs separately from collection.
-            with sqlite3.connect(database,timeout=30) as conn:
+            with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
                 _enqueue(conn,'live','',90,time.time())
             with (_budgeted_collectors(budget),ThreadPoolExecutor(max_workers=concurrency) as pool,
                   ThreadPoolExecutor(max_workers=1) as discovery_pool,
@@ -603,10 +603,10 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
                         except (OSError,ValueError,sqlite3.Error) as exc:
                             message=_discovery_error_message(exc)
                         if message is not None:
-                            with sqlite3.connect(database,timeout=30) as conn:
+                            with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
                                 conn.execute('UPDATE worker_state SET last_error=? WHERE singleton=1',(message,))
                         else:
-                            with sqlite3.connect(database,timeout=30) as conn:
+                            with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
                                 conn.execute("""UPDATE worker_state SET last_error=NULL WHERE singleton=1 AND
                                   (last_error LIKE 'Account discovery could not be read%' OR
                                    last_error LIKE 'Account discovery failed %')""")
@@ -643,6 +643,6 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
                     attempts+=1
         finally:
             heartbeat_stop.set();thread.join(timeout=2)
-            with sqlite3.connect(database,timeout=30) as conn:
+            with closing(sqlite3.connect(database,timeout=30)) as conn, conn:
                 conn.execute("UPDATE worker_state SET state='stopped',stopped_at=? WHERE singleton=1 AND owner_token=?",(_iso(),token))
     return {'state':'stopped','attempt_count':attempts}

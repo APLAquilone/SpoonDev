@@ -1,5 +1,6 @@
 """Restart an owned automatic collector without restarting the web or tunnel."""
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -44,7 +45,10 @@ def _mark_restart(database, delay, message):
     # An existing worker owns its own status. Waiting supervisors do not alter
     # that worker's PID, heartbeat, cooldown, or state.
     try:
-        with sqlite3.connect(Path(database).resolve().as_uri()+'?mode=rw',uri=True,timeout=30) as conn:
+        # SQLite's own context manager commits/rolls back, but never closes
+        # the connection. Restart loops must release their file descriptors
+        # immediately, including on error, rather than waiting for cyclic GC.
+        with closing(sqlite3.connect(Path(database).resolve().as_uri()+'?mode=rw',uri=True,timeout=30)) as conn, conn:
             conn.execute("""UPDATE worker_state SET state='restarting',restart_at=?,last_error=?
               WHERE singleton=1 AND pid=? AND state!='running'""",
               (time.time()+delay,message,os.getpid()))
