@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import sqlite3
 import tempfile
@@ -63,20 +64,24 @@ class CollectorStopTests(unittest.TestCase):
         self.assertEqual(self.verify(selected=self.pid), self.evidence)
 
     def test_supervisor_can_predate_worker_restart_but_paths_are_exact(self):
-        current = dict(self.process, command=f'/usr/bin/python3.12 {self.root}/scripts/supervise-collector.py --skip-loaded-service',
+        current = dict(self.process, command=shlex.join(['/usr/bin/python3.12',
+                       str(self.root / 'scripts/supervise-collector.py'), '--skip-loaded-service']),
                        started=(datetime.fromisoformat(self.process['started'])-timedelta(days=1)).isoformat())
         self.assertEqual(self.verify(current=current)['kind'], 'supervisor')
 
     def test_supervisor_relative_path_and_absolute_db_are_accepted(self):
-        command = f'/usr/bin/python3.12 scripts/supervise-collector.py --db {self.db} --auth-db {self.auth}'
+        command = shlex.join(['/usr/bin/python3.12', 'scripts/supervise-collector.py',
+                              '--db', str(self.db), '--auth-db', str(self.auth)])
         self.assertEqual(helper.command_kind(command, self.root, self.db, self.auth), 'supervisor')
 
     def test_cli_explicit_global_database_is_accepted(self):
-        command = f'/usr/bin/python3.12 -m spoondev --db {self.db} collect-auto --auth-db {self.auth}'
+        command = shlex.join(['/usr/bin/python3.12', '-m', 'spoondev', '--db', str(self.db),
+                              'collect-auto', '--auth-db', str(self.auth)])
         self.assertEqual(helper.command_kind(command, self.root, self.db, self.auth), 'collect-auto')
 
     def test_other_database_auth_database_and_unknown_flags_fail_closed(self):
-        for command in (f'/usr/bin/python3.12 -m spoondev --db {self.root}/elsewhere.sqlite3 collect-auto',
+        for command in (shlex.join(['/usr/bin/python3.12', '-m', 'spoondev', '--db',
+                                   str(self.root / 'elsewhere.sqlite3'), 'collect-auto']),
                         '/usr/bin/python3.12 -m spoondev collect-auto --auth-db ../other/accounts.sqlite3',
                         '/usr/bin/python3.12 -m spoondev collect-auto --unknown 4'):
             with self.subTest(command=command), self.assertRaises(helper.UnsafeCollector):
@@ -88,7 +93,8 @@ class CollectorStopTests(unittest.TestCase):
                         '/usr/bin/python3.12 -m spoondev serve --port 8080',
                         '/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:8080',
                         'bash scripts/start-public-mac.sh',
-                        f'/usr/bin/python3.12 {self.root.parent}/other/scripts/supervise-collector.py'):
+                        shlex.join(['/usr/bin/python3.12',
+                                    str(self.root.parent / 'other/scripts/supervise-collector.py')])):
             with self.subTest(command=command), self.assertRaises(helper.UnsafeCollector):
                 helper.command_kind(command, self.root, self.db, self.auth)
 
