@@ -455,7 +455,7 @@ class WorkerTests(unittest.TestCase):
         self.assertIsNone(worker._claim(self.database))
 
     def test_real_collectors_use_shared_budget_and_preserve_period_semantics(self):
-        stop = threading.Event(); seen = set(); guard = threading.Lock()
+        stop = threading.Event(); seen = set(); requests = []; guard = threading.Lock()
         profiledb.initialize(self.database)
         profiledb.cache_users(self.database, [{'id': '10', 'name': 'Owned DJ'}])
         live_url = 'https://jp-api.spooncast.net/lives/'
@@ -466,16 +466,17 @@ class WorkerTests(unittest.TestCase):
                      monthly_url: {'results': [{'user': {'id': 77, 'nickname': 'Listener'}, 'favoriteTemperature': 35}], 'next': None}}
         def fetch(url, **kwargs):
             with guard:
+                requests.append(url)
                 seen.add(url)
                 if seen == set(responses):stop.set()
             return responses[url]
         from spoondev import spoon, monthly, directory
         originals = [module.fetch_snapshot for module in (spoon, monthly, gifts, directory)]
-        with patch('spoondev.worker.fetch_snapshot', side_effect=fetch) as network, \
+        with patch('spoondev.worker.fetch_snapshot', new=fetch), \
                 patch('spoondev.worker.REQUEST_SPACING', 0), patch('spoondev.gifts._last_request', None):
             result = worker.run(self.database, self.auth, stop_event=stop, concurrency=3)
         self.assertEqual(result['attempt_count'], 3)
-        self.assertEqual(network.call_count, 3)
+        self.assertCountEqual(requests, list(responses))
         self.assertEqual([module.fetch_snapshot for module in (spoon, monthly, gifts, directory)], originals)
         with sqlite3.connect(self.database) as conn:
             ranking = gifts.read_ranking(conn, '10')

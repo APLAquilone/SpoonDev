@@ -110,16 +110,34 @@ class MonthlyTests(unittest.TestCase):
         self.assertIn('origin',summary['errors'][0])
 
     def test_default_follows_beyond_old_page_cap(self):
+        import threading
         from urllib.parse import urlsplit,parse_qs
+        requests={'10':[],'20':[]}
+        lock=threading.Lock()
         def fetch(url):
-            page=int(parse_qs(urlsplit(url).query).get('cursor',['0'])[0])
+            parsed=urlsplit(url);query=parse_qs(parsed.query)
+            dj_id=parsed.path.split('/')[-2]
+            page=int(query.get('cursor',['0'])[0])
+            # Mock.call_count increments are not synchronized across threads.
+            # Record the actual pages per DJ instead of that shared counter.
+            with lock:
+                requests[dj_id].append((page,query.get('rankType')))
             return {'results':[{'user':{'id':1000+page,'nickname':'listener'},'favoriteTemperature':1}],
                     'next':str(page+1) if page<104 else None}
-        with patch('spoondev.monthly.fetch_snapshot',side_effect=fetch) as mock,patch('spoondev.monthly.time.sleep'):
+        with patch('spoondev.monthly.fetch_snapshot',new=fetch),patch('spoondev.monthly.time.sleep'):
             summary=collect_monthly(self.path,max_djs=0)
-        self.assertEqual(mock.call_count,210)
+        for dj_id,pages in requests.items():
+            with self.subTest(dj_id=dj_id):
+                self.assertEqual(pages,[(page,['MONTHLY']) for page in range(105)])
         self.assertTrue(summary['complete'])
+        self.assertEqual(summary['errors'],[])
+        self.assertEqual(summary['dj_count'],2)
         self.assertEqual(summary['user_count'],105)
+        with sqlite3.connect(self.path) as conn:
+            rows=conn.execute('''SELECT s.dj_id,s.complete,COUNT(l.listener_id)
+              FROM monthly_dj_snapshots s JOIN monthly_dj_listeners l ON l.snapshot_id=s.id
+              GROUP BY s.id ORDER BY s.dj_id''').fetchall()
+        self.assertEqual(rows,[('10',1,105),('20',1,105)])
 
     def test_optional_cap_and_cycle_still_stop(self):
         page=dict(self.page,next='repeat')

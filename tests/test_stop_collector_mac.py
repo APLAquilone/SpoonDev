@@ -1,9 +1,12 @@
 """Exercise safe ownership checks without stopping real host processes."""
 import copy
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import errno
 import fcntl
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import signal
@@ -21,6 +24,12 @@ spec.loader.exec_module(helper)
 
 class CollectorStopTests(unittest.TestCase):
     def setUp(self):
+        # Release validation runs this module alongside the production launcher.
+        # Keep simulated PID and signal messages inside their test assertions.
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+        self.enterContext(redirect_stdout(self.stdout))
+        self.enterContext(redirect_stderr(self.stderr))
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
         self.root = Path(self.folder.name).resolve() / 'SpoonDev'
@@ -197,6 +206,9 @@ class CollectorStopTests(unittest.TestCase):
             self.assertEqual(helper.stop(self.root, self.pid), self.evidence)
         self.assertEqual(verify.call_count, 2)
         kill.assert_called_once_with(self.pid, signal.SIGTERM)
+        self.assertIn(f'Graceful stop requested for verified collector PID {self.pid}.', self.stdout.getvalue())
+        self.assertIn('Collector exited and its OS lease was released.', self.stdout.getvalue())
+        self.assertEqual(self.stderr.getvalue(), '')
 
     def test_changed_owner_token_prevents_all_signals(self):
         second = copy.deepcopy(self.evidence)
@@ -222,6 +234,7 @@ class CollectorStopTests(unittest.TestCase):
             with self.assertRaisesRegex(helper.UnsafeCollector, 'No forced termination'):
                 helper.stop(self.root, self.pid)
         kill.assert_called_once_with(self.pid, signal.SIGTERM)
+        self.assertNotIn('Collector exited', self.stdout.getvalue())
 
     def test_reused_pid_while_stopping_gets_no_further_signal(self):
         with (patch.object(helper, 'verify', return_value=self.evidence),
@@ -254,12 +267,20 @@ class CollectorStopTests(unittest.TestCase):
             self.assertEqual(helper.main([]), 0)
         verify.assert_called_once()
         stop.assert_not_called()
+        output = self.stdout.getvalue()
+        evidence, end = json.JSONDecoder().raw_decode(output)
+        self.assertEqual(evidence, self.evidence)
+        self.assertIn('Inspection only. No process was signaled;', output[end:])
+        self.assertNotIn('Graceful stop requested', output)
+        self.assertEqual(self.stderr.getvalue(), '')
 
     def test_stop_main_requires_pid_and_never_sends_signals_when_unverified(self):
         with (patch.object(helper.sys, 'platform', 'darwin'),
               patch.object(helper.os, 'kill') as kill):
             self.assertEqual(helper.main(['--stop']), 1)
         kill.assert_not_called()
+        self.assertEqual(self.stdout.getvalue(), '')
+        self.assertIn('Collector operation stopped: --stop requires an explicit valid --pid', self.stderr.getvalue())
 
 
 if __name__ == '__main__':
