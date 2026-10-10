@@ -13,7 +13,7 @@ import unittest
 
 UPDATE_SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/update-dev-mac.sh'
 GITHUB_URL = 'https://github.com/APLAquilone/SpoonDev.git'
-DEV_BRANCH = 'dev/v0.2.2'
+DEV_BRANCH = 'dev/v0.3.0'
 
 
 class DevUpdateTests(unittest.TestCase):
@@ -73,8 +73,8 @@ class DevUpdateTests(unittest.TestCase):
             GIT_TERMINAL_PROMPT='0',
         )
         self.git(self.upstream, 'switch', '-c', DEV_BRANCH)
-        (self.upstream / 'spoondev/__init__.py').write_text("__version__ = '0.2.2'\n")
-        self.release_commit = self.commit(self.upstream, 'Development v0.2.2')
+        (self.upstream / 'spoondev/__init__.py').write_text("__version__ = '0.3.0'\n")
+        self.release_commit = self.commit(self.upstream, 'Development v0.3.0')
 
     def git(self, root, *arguments):
         return subprocess.check_output(
@@ -112,7 +112,7 @@ class DevUpdateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git(self.dev, 'branch', '--show-current'), DEV_BRANCH)
         self.assertEqual(self.git(self.dev, 'rev-parse', 'HEAD'), self.release_commit)
-        self.assertIn('Development code updated to v0.2.2', result.stdout)
+        self.assertIn('Development code updated to v0.3.0', result.stdout)
         self.assertEqual(self.installations(), [['-m', 'pip', 'install', '-e', '.']])
         self.assert_private_data_and_production_preserved()
 

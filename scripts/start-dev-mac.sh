@@ -32,9 +32,9 @@ cleanup(){
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 if [ "${SPOONDEV_COLLECT:-0}" = 1 ]; then
-    python -m spoondev collect-auto >> data/collector.log 2>&1 &
+    python scripts/supervise-collector.py --skip-loaded-service >> data/collector.log 2>&1 &
     worker_pid=$!
-    printf 'Automatic Dev collection enabled. Log: data/collector.log\n'
+    printf 'Supervised Dev collection enabled. Log: data/collector.log\n'
 else
     printf 'Dev uses saved observations. Enable its separate collector with SPOONDEV_COLLECT=1.\n'
 fi

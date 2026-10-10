@@ -1,4 +1,5 @@
 import unittest
+import threading
 from unittest.mock import patch
 
 from spoondev.collector import FetchError
@@ -95,6 +96,28 @@ class SpoonTests(unittest.TestCase):
         with self.assertRaises(SpoonRateLimit) as caught:
             self.run_collect({BASE + "/lives/": FetchError("url", "HTTP 429", 429)})
         self.assertEqual(caught.exception.retry_after, 60)
+
+    def test_unlimited_pages_follow_all_pages_without_truncation(self):
+        following=BASE+'/lives/1/listeners/?cursor=second'
+        endpoints=self.endpoints(response([USER],following))
+        endpoints[following]=response([{'id':21,'nickname':'Second'}])
+        snapshots,errors=self.run_collect(endpoints,max_pages=0)
+        self.assertFalse(errors)
+        self.assertTrue(snapshots[0]['complete'])
+        self.assertEqual(len(snapshots[0]['listeners']),2)
+
+    def test_stop_before_collection_makes_no_request_or_empty_snapshot(self):
+        stop=threading.Event();stop.set()
+        with patch('spoondev.spoon.fetch_snapshot') as fetch:
+            snapshots,errors=collect_spoon(stopped_event=stop)
+        fetch.assert_not_called();self.assertEqual(snapshots,[])
+        self.assertTrue(errors)
+
+    def test_missing_temperature_is_kept_unknown(self):
+        listener=dict(USER,favorite_temperature=None)
+        snapshots,errors=self.run_collect(self.endpoints(response([listener])))
+        self.assertFalse(errors)
+        self.assertNotIn('favorite_temperature',snapshots[0]['listeners'][0])
 
 
 if __name__ == "__main__":

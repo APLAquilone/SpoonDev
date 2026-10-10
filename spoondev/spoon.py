@@ -6,6 +6,7 @@ Pagination is not an atomic snapshot of a changing live room.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from itertools import count
 from datetime import datetime, timezone
 import math
 import threading
@@ -40,11 +41,11 @@ def _user(value):
 
 
 def collect_spoon(base_url="https://jp-api.spooncast.net", concurrency=4,
-                  max_rooms=10, max_pages=100, timeout=20, room_callback=None):
+                  max_rooms=10, max_pages=100, timeout=20, room_callback=None, stopped_event=None):
     """Return (canonical snapshots, explicit error strings), bounded by room/page caps."""
-    if any(isinstance(v, bool) or not isinstance(v, int) or v < 1
-           for v in (concurrency, max_pages)) or isinstance(max_rooms, bool) or not isinstance(max_rooms, int) or max_rooms < 0:
-        raise ValueError("Concurrency/page cap must be positive integers; room cap must be nonnegative")
+    if (type(concurrency) is not int or concurrency<1 or
+            any(type(v) is not int or v<0 for v in (max_pages,max_rooms))):
+        raise ValueError("Concurrency must be positive; page and room caps must be nonnegative integers")
     if timeout <= 0:
         raise ValueError("Timeout must be positive")
     base_url = base_url.rstrip("/")
@@ -58,6 +59,8 @@ def collect_spoon(base_url="https://jp-api.spooncast.net", concurrency=4,
     rate_lock = threading.Lock()
 
     def page(url, path):
+        if stopped_event is not None and stopped_event.is_set():
+            raise ValueError('Collection stopped')
         target = urlsplit(url)
         if (target.scheme, target.netloc, target.path) != (base.scheme, base.netloc, path) or target.fragment:
             raise ValueError("Pagination URL changed origin or endpoint")
@@ -66,7 +69,9 @@ def collect_spoon(base_url="https://jp-api.spooncast.net", concurrency=4,
                 raise rate_limit[0]
             delay = 0.1 - (time.monotonic() - last_request[0])
             if delay > 0:
-                time.sleep(delay)
+                if stopped_event is not None:
+                    if stopped_event.wait(delay):raise ValueError('Collection stopped')
+                else:time.sleep(delay)
             if rate_limit[0] is not None:
                 raise rate_limit[0]
             last_request[0] = time.monotonic()
@@ -93,7 +98,7 @@ def collect_spoon(base_url="https://jp-api.spooncast.net", concurrency=4,
     seen = set()
     url = base_url + "/lives/"
     try:
-        for _ in range(max_pages):
+        for _ in (range(max_pages) if max_pages else count()):
             if url in seen:
                 raise ValueError("Live pagination cycle")
             seen.add(url)
@@ -141,7 +146,7 @@ def collect_spoon(base_url="https://jp-api.spooncast.net", concurrency=4,
                     "state": 'completed' if complete else 'partial' if snapshot else 'failed'})
             return snapshot, room_errors
         try:
-            for _ in range(max_pages):
+            for _ in (range(max_pages) if max_pages else count()):
                 if url in seen:
                     raise ValueError("Listener pagination cycle")
                 seen.add(url)

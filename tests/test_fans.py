@@ -71,7 +71,7 @@ class FanTests(unittest.TestCase):
         self.assertEqual(self.db.read_bytes(),before)
         self.assertEqual(webdata.fan_destinations(self.db,'999')['owner'],None)
 
-    def test_activity_sort_uses_latest_observation_and_nulls_last(self):
+    def test_activity_sort_keeps_categories_first_and_nulls_last(self):
         self.put(['20','21','22'],True)
         now=datetime.now(timezone.utc)
         for minute,listener in [(90,'20'),(60,'21'),(5,'20')]:
@@ -79,7 +79,11 @@ class FanTests(unittest.TestCase):
                 'listeners':[{'id':listener,'name':listener}],'complete':True,
                 'observed_at':(now-timedelta(minutes=minute)).isoformat()})
         self.assertEqual([u['id'] for u in webdata.fan_destinations(self.db,'10',sort='activity')['fans']],['20','21','22'])
-        self.assertEqual([u['id'] for u in webdata.fan_destinations(self.db,'10',sort='oldest')['fans']],['21','20','22'])
+        # Three-category layout is always prioritized; the chosen sort applies
+        # within each category, including older recorded fans before unknowns.
+        oldest=webdata.fan_destinations(self.db,'10',sort='oldest')['fans']
+        self.assertEqual([u['id'] for u in oldest],['20','21','22'])
+        self.assertEqual([u['activity_state'] for u in oldest],['recent','registered','registered'])
 
     def test_old_live_temperature_does_not_manufacture_monthly_ranking(self):
         self.put([{'id':'315888158','name':'つくちゃん'}],True)

@@ -113,6 +113,8 @@ if Path(sys.argv[0]).name=='cloudflared':
     print('https://controlled-launcher-test.trycloudflare.com',flush=True)
     stop.wait()
     record('tunnel_stop')
+elif len(sys.argv)>1 and Path(sys.argv[1]).name=='supervise-collector.py':
+    record('worker_start');stop.wait();record('worker_stop')
 elif sys.argv[1:3]==['-m','spoondev']:
     if sys.argv[3]=='collect-auto':
         record('worker_start');stop.wait();record('worker_stop')

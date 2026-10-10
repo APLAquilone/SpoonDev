@@ -37,7 +37,10 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
         if not auth or host not in ('127.0.0.1','localhost') or parsed.scheme!='https' or not parsed.netloc or parsed.path not in ('','/') or parsed.query or parsed.fragment or parsed.username:
             raise ValueError('External publication requires auth, a loopback host, and an HTTPS origin')
         public_url='https://'+parsed.netloc
-    if auth: accounts.initialize(auth_database)
+    if auth:
+        accounts.initialize(auth_database)
+        from . import announcements
+        announcements.initialize(auth_database)
     login_lock=threading.Lock()
     attempts=[]
     database = str(Path(database).resolve())
@@ -164,6 +167,18 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 result=accounts.account_settings(self.private_db)
                 result['can_change']=self.user['role']=='admin' or not result['spoon_profile']
                 self.respond(200,result);return
+            if path=='/api/announcements':
+                if not auth:
+                    self.respond(401,{'error':'ログインしてください。'});return
+                if urlsplit(self.path).query:
+                    raise ValueError('Invalid announcement parameter')
+                result=(announcements.list_for_user(auth_database)
+                        if self.user['role']=='user' else {'announcements':[]})
+                self.respond(200,result);return
+            if auth and path=='/api/admin/announcements':
+                if urlsplit(self.path).query:
+                    raise ValueError('Invalid announcement parameter')
+                self.respond(200,announcements.list_admin(auth_database));return
             if auth and path=='/api/account/profile-preview':
                 query=parse_qs(urlsplit(self.path).query,max_num_fields=3)
                 from .directory import DirectoryError
@@ -238,17 +253,15 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                         private_database=self.private_db if auth else None, sort=query.get('sort',['recent'])[0],
                         q=query.get('q',[''])[0], activity=query.get('activity',['all'])[0])
                     if auth and self.user['username']!='kitomoya':result.pop('indexed_djs',None)
-                    self.enrich(result['fans'])
                     self.respond(200,result)
                 elif route.path == '/fan-export.js':
                     self.respond(200, Path(__file__).with_name('static').joinpath('fan-export.js').read_bytes(), 'text/javascript; charset=utf-8')
-                elif route.path in ('/theme.css','/analytics.js'):
+                elif route.path in ('/theme.css','/analytics.js','/announcements.js'):
                     content_type='text/css; charset=utf-8' if route.path.endswith('.css') else 'text/javascript; charset=utf-8'
                     self.respond(200,Path(__file__).with_name('static').joinpath(route.path[1:]).read_bytes(),content_type)
                 elif route.path == '/api/favorites/activity':
                     ids = query.get('ids', [''])[0]
                     result=webdata.favorite_activity(database, ids.split(',') if ids else [])
-                    self.enrich(result['users'])
                     self.respond(200,result)
                 elif route.path == '/api/users':
                     term = query.get('q',[''])[0].strip()
@@ -264,11 +277,27 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                             result = webdata.search_users(database,term,limit=50,offset=offset)
                             result['warning'] = str(exc)+' 保存済みデータの検索結果を表示しています。'
                             result['source'] = 'local_fallback'
-                        self.enrich(result['users'])
                         self.respond(200,result)
                     else:
                         result=webdata.search_users(database, term, limit=50, offset=offset)
-                        self.enrich(result['users'])
+                        self.respond(200,result)
+                elif route.path.startswith('/api/users/') and route.path.endswith('/activity'):
+                    user_id = route.path[len('/api/users/'):-len('/activity')]
+                    # Heatmaps read saved evidence only; malformed IDs cannot
+                    # trigger a remote profile lookup or select private data.
+                    if fans.numeric_id(user_id) != user_id:
+                        raise ValueError('Invalid account ID')
+                    activity_query = parse_qs(route.query,max_num_fields=1,keep_blank_values=True)
+                    if set(activity_query)-{'days'} or any(len(values)!=1 for values in activity_query.values()):
+                        raise ValueError('Invalid activity parameter')
+                    days = int(activity_query.get('days',['7'])[0])
+                    if days not in (7,28):
+                        raise ValueError('Invalid activity window')
+                    from .analytics import user_activity
+                    result = user_activity(database,user_id,days=days)
+                    if result is None:
+                        self.respond(404,{'error':'保存済みのユーザーが見つかりません。'})
+                    else:
                         self.respond(200,result)
                 elif route.path.startswith('/api/users/'):
                     user_id = unquote(route.path[len('/api/users/'):])
@@ -305,7 +334,7 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
 
         def do_POST(self):
             path=urlsplit(self.path).path
-            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites','/api/password','/api/account/settings','/api/admin/labels','/api/admin/users/spoon-profile','/api/admin/users/reset-password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/role','/api/admin/users/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
+            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites','/api/password','/api/account/settings','/api/admin/labels','/api/admin/users/spoon-profile','/api/admin/users/reset-password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/role','/api/admin/users/delete','/api/admin/announcements/save','/api/admin/announcements/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
                 self.respond(405,{'error':'この操作は利用できません。'}); return
             if path!='/api/login' and not self.gate(): return
             origin=self.headers.get('Origin')
@@ -345,7 +374,13 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 if path=='/api/password':
                     result=accounts.change_password(auth_database,self.user['id'],payload.get('current_password'),payload.get('new_password'))
                     self.respond(200,result,headers={'Set-Cookie':'spoondev_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'+('; Secure' if public_url else '')});return
-                if path=='/api/account/settings':
+                if path=='/api/admin/announcements/save':
+                    result=announcements.save(auth_database,payload,self.user)
+                elif path=='/api/admin/announcements/delete':
+                    if payload.get('confirm') is not True:
+                        raise ValueError('お知らせの削除を確認してください。')
+                    result=announcements.delete(auth_database,payload.get('id'))
+                elif path=='/api/account/settings':
                     if 'spoon_id' not in payload: raise ValueError('spoon_id を明示してください。解除する場合は null を指定してください。')
                     raw=payload.get('spoon_id')
                     if self.user['role']!='admin' and self.own_profile():
@@ -406,6 +441,8 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 self.respond(409,{'error':str(exc)})
             except PermissionError as exc:
                 self.respond(403,{'error':str(exc)})
+            except LookupError:
+                self.respond(404,{'error':'対象のお知らせが見つかりません。'})
             except (ValueError,UnicodeError) as exc:
                 self.respond(400, {'error':str(exc)})
             except (sqlite3.Error,OSError):

@@ -73,11 +73,18 @@ def collect_monthly(database,max_djs=100,concurrency=4,max_pages=0,progress_call
         targets=list(dict.fromkeys(numeric_id(uid) for uid in dj_ids))
     selection=targets[:max_djs] if explicit and max_djs else targets
     with sqlite3.connect(Path(database).resolve().as_uri()+'?mode=ro',uri=True) as conn:
-        rows=conn.execute('''WITH known AS (SELECT broadcaster_id,MAX(observed_at) AS recent
-          FROM snapshots GROUP BY broadcaster_id) SELECT u.id,u.name,
-          (SELECT a.tag FROM user_attributes a JOIN snapshots ts ON ts.id=a.snapshot_id
-           WHERE a.user_id=u.id ORDER BY ts.observed_at DESC,ts.id DESC LIMIT 1)
-          FROM known k JOIN users u ON u.id=k.broadcaster_id ORDER BY k.recent DESC,u.id''').fetchall()
+        if explicit:
+            # Automatic collection dispatches one DJ at a time. Materializing
+            # every known DJ for each such job makes a sweep quadratic.
+            known_dj_count=conn.execute('SELECT COUNT(DISTINCT broadcaster_id) FROM snapshots').fetchone()[0]
+            rows=[]
+        else:
+            rows=conn.execute('''WITH known AS (SELECT broadcaster_id,MAX(observed_at) AS recent
+              FROM snapshots GROUP BY broadcaster_id) SELECT u.id,u.name,
+              (SELECT a.tag FROM user_attributes a JOIN snapshots ts ON ts.id=a.snapshot_id
+               WHERE a.user_id=u.id ORDER BY ts.observed_at DESC,ts.id DESC LIMIT 1)
+              FROM known k JOIN users u ON u.id=k.broadcaster_id ORDER BY k.recent DESC,u.id''').fetchall()
+            known_dj_count=len(rows)
         cached=_target_profiles(conn,selection) if explicit else {}
     all_djs=[{'id':u,'name':n,'tag':t} for u,n,t in rows]
     resolution_errors=[]
@@ -198,5 +205,5 @@ def collect_monthly(database,max_djs=100,concurrency=4,max_pages=0,progress_call
     return {'dj_count':successful_djs,'user_count':len(grouped),'complete':complete,
             'errors':errors,'month':month,'source':'monthly_profile','rank_type':'MONTHLY',
             'coverage':'selected_broadcasters' if explicit else 'known_broadcasters',
-            'known_dj_count':len(all_djs),'selected_dj_count':selected_count,'requested_dj_count':requested_count,
+            'known_dj_count':known_dj_count,'selected_dj_count':selected_count,'requested_dj_count':requested_count,
             'capped':cap,'retry_after':retry_after[0]}

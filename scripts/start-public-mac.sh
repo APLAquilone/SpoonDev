@@ -82,9 +82,9 @@ for _ in range(40):
 else: raise SystemExit('Authenticated web server did not become ready')
 PY
 if [ "${SPOONDEV_COLLECT:-1}" = 1 ]; then
-    python -m spoondev collect-auto >> data/collector.log 2>&1 &
+    python scripts/supervise-collector.py --skip-loaded-service >> data/collector.log 2>&1 &
     worker_pid=$!
-    printf 'Automatic collection enabled. Log: data/collector.log\n'
+    printf 'Supervised collection enabled. Log: data/collector.log\n'
 else
     printf 'Automatic collection disabled; existing manual collectors were kept running.\n'
 fi

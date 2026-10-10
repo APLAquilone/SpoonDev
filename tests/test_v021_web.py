@@ -204,7 +204,7 @@ class V021WebTests(unittest.TestCase):
                     if user['id'] == created[2]['id'])
         self.assertEqual((user['role'], user['label'], user['must_change']), ('user', '管理者', 1))
 
-    def test_listener_insights_are_shared_across_every_display_surface(self):
+    def test_listener_insights_match_detail_and_dashboard_and_lists_load_lazily(self):
         self.assertEqual(self.bind()[0], 200)
         fans = {'owner': {'id': '123', 'name': 'Alice DJ'},
                 'followers': [{'id': '456', 'name': 'Listener'}], 'complete': True}
@@ -228,9 +228,13 @@ class V021WebTests(unittest.TestCase):
         expected = own['insights']
         self.assertIsInstance(expected, dict)
         self.assertTrue(expected)
-        for listener in (detail[2], search[2]['users'][0], favorites[2]['users'][0], fan_list[2]['fans'][0]):
+        self.assertEqual(detail[2]['id'], '456')
+        self.assertEqual(detail[2]['insights'], expected)
+        # Compact lists now load the same detailed metrics on expansion. Their
+        # normal polling response must avoid recalculating 28-day indices.
+        for listener in (search[2]['users'][0], favorites[2]['users'][0], fan_list[2]['fans'][0]):
             self.assertEqual(listener['id'], '456')
-            self.assertEqual(listener['insights'], expected)
+            self.assertNotIn('insights', listener)
 
 
 if __name__ == '__main__':

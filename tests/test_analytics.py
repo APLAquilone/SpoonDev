@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from spoondev import db, fans, profiledb
-from spoondev.analytics import summary
+from spoondev.analytics import summary, user_activity
 
 
 class AnalyticsTests(unittest.TestCase):
@@ -72,12 +72,13 @@ class AnalyticsTests(unittest.TestCase):
         self.sighting(["200", "201", "202", "203", "204", "205"])
         result = summary(self.database, self.private, now=self.now)
         self.assertEqual(result["cohorts"], {
-            "registered_fan_count": 2, "monthly_confirmed_count": 2,
+            "registered_fan_count": 2, "monthly_visitor_count": 6, "cohort_count": 6,
+            "monthly_confirmed_count": 2,
             "overlap_count": 1, "classification": "current",
         })
         for collection in (result["totals"], result["hourly"][12], result["daily"][-1]["hours"][12]):
             self.assertEqual({key: collection[key] for key in ("all", "fans", "monthly", "overlap", "other")},
-                             {"all": 6, "fans": 2, "monthly": 2, "overlap": 1, "other": 3})
+                             {"all": 6, "fans": 2, "monthly": 2, "overlap": 1, "other": 4})
         self.assertEqual(result["monthly"]["listener_count"], 5)
         self.assertEqual(result["monthly"]["confirmed_listener_count"], 2)
 
@@ -133,22 +134,22 @@ class AnalyticsTests(unittest.TestCase):
         self.assertFalse(missing.exists())
         self.assertEqual(summary(missing, None, now=self.now)["state"], "needs_profile")
 
-    def test_unknown_complete_empty_and_partial_empty_are_distinct(self):
+    def test_empty_room_scans_never_prove_cohort_is_offline(self):
         initial = summary(self.database, self.private, now=self.now)
         self.assertEqual(initial["state"], "not_collected")
         self.assertIsNone(initial["totals"]["all"])
         self.assertIsNone(initial["hourly"][11]["all"])
         self.sighting([], self.now-timedelta(minutes=30), complete=False)
         partial = summary(self.database, self.private, now=self.now)
-        self.assertEqual(partial["state"], "partial")
+        self.assertEqual(partial["state"], "not_observed")
         self.assertIsNone(partial["totals"]["all"])
         self.assertIsNone(partial["hourly"][11]["all"])
-        self.assertTrue(partial["hourly"][11]["partial"])
-        self.assertEqual(partial["hourly"][11]["snapshot_count"], 1)
+        self.assertFalse(partial["hourly"][11]["partial"])
+        self.assertEqual(partial["hourly"][11]["snapshot_count"], 0)
         self.sighting([], self.now-timedelta(minutes=20))
         known_empty = summary(self.database, self.private, now=self.now)
-        self.assertEqual(known_empty["totals"]["all"], 0)
-        self.assertEqual(known_empty["hourly"][11]["all"], 0)
+        self.assertIsNone(known_empty["totals"]["all"])
+        self.assertIsNone(known_empty["hourly"][11]["all"])
         self.assertIsNone(known_empty["hourly"][11]["monthly"])
         self.assertIsNone(known_empty["hourly"][10]["all"])
 
@@ -171,10 +172,10 @@ class AnalyticsTests(unittest.TestCase):
         result = summary(self.database, self.private, now=self.now)
         hour = result["hourly"][12]
         self.assertEqual(hour["all"], 2)
-        self.assertEqual(hour["observed_days"], 3)
-        self.assertEqual(hour["known_days"], 2)
+        self.assertEqual(hour["observed_days"], 1)
+        self.assertEqual(hour["known_days"], 1)
         self.assertEqual(result["daily"][-2]["hours"][12]["known_days"], 0)
-        self.assertEqual(result["daily"][-1]["hours"][12]["known_days"], 1)
+        self.assertEqual(result["daily"][-1]["hours"][12]["known_days"], 0)
 
     def test_first_observed_and_repeat_use_own_history_not_other_dj(self):
         self.sighting(["200"], self.now-timedelta(days=10))
@@ -197,6 +198,7 @@ class AnalyticsTests(unittest.TestCase):
         self.sighting(["201"], now-timedelta(minutes=10))
         self.sighting(["202"], now-timedelta(minutes=1))
         self.sighting(["999"], now+timedelta(minutes=1))
+        self.import_fans(["200", "201"])
         self.ranking([("200", 30)], month="2026-10", at=now-timedelta(days=1))
         self.ranking([("202", 50)], month="2026-11", at=now-timedelta(minutes=1))
         self.ranking([("999", 100)], month="2026-11", at=now+timedelta(minutes=1))
@@ -212,6 +214,7 @@ class AnalyticsTests(unittest.TestCase):
         self.assertIsNone(result["daily"][-1]["hours"][1]["all"])
 
     def test_28_day_range_and_strict_validation(self):
+        self.import_fans(["200"])
         self.sighting(["200"], self.now-timedelta(days=14))
         self.assertIsNone(summary(self.database, self.private, now=self.now)["totals"]["all"])
         result = summary(self.database, self.private, days=28, now=self.now)
@@ -252,6 +255,127 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(result["totals"]["fans"], 0)
         self.assertIsNone(result["totals"]["monthly"])
         self.assertEqual(result["monthly"]["state"], "not_collected")
+
+    def test_fan_monthly_member_and_this_month_visitor_are_seen_outside_own_stream_hours(self):
+        self.import_fans(["200"])
+        self.ranking([("201", 90), ("299", 0)])
+        self.sighting(["202"], self.now-timedelta(days=7, hours=1))
+        # None of the positive activity in the selected window is at the linked
+        # broadcaster's room. A fan need not ever have been seen at that room.
+        other_time = self.now-timedelta(hours=8)  # 04:00 JST.
+        self.sighting(["200", "201", "202", "299", "999"], other_time, dj="900")
+        self.sighting(["200", "201"], other_time+timedelta(minutes=10), dj="901")
+        result = summary(self.database, self.private, now=self.now)
+        cell = result["daily"][-1]["hours"][4]
+        self.assertEqual({key: cell[key] for key in ("all", "fans", "visitors", "monthly", "other")},
+                         {"all": 3, "fans": 1, "visitors": 1, "monthly": 1, "other": 2})
+        self.assertEqual(result["totals"]["all"], 3)
+        self.assertEqual(result["cohorts"]["cohort_count"], 3)
+        self.assertEqual(result["cohorts"]["monthly_visitor_count"], 1)
+        self.assertEqual(result["totals"]["last_observed_at"],
+                         (other_time+timedelta(minutes=10)).isoformat(timespec="microseconds"))
+        self.assertEqual(result["scope"], "cohort_across_rooms")
+        self.assertIsNone(result["daily"][-1]["hours"][12]["all"])
+
+    def test_current_month_cohort_excludes_old_visitors_future_visitors_and_unrelated_private_fans(self):
+        # Last month's visit alone does not put this listener into this month's
+        # cohort, even if activity is visible at another broadcaster today.
+        self.sighting(["200"], datetime(2026, 9, 30, 14, 59, tzinfo=timezone.utc))
+        self.sighting(["201"], self.now+timedelta(minutes=1))
+        self.import_fans(["202"], owner="900")
+        with sqlite3.connect(self.private) as conn:
+            conn.execute("INSERT INTO favorites VALUES('203','favorite',NULL)")
+        self.sighting(["200", "201", "202", "203", "999"], dj="900")
+        result = summary(self.database, self.private, now=self.now)
+        self.assertEqual(result["state"], "not_observed")
+        self.assertEqual(result["cohorts"]["cohort_count"], 0)
+        self.assertIsNone(result["totals"]["all"])
+        self.assertIsNone(result["daily"][-1]["hours"][12]["all"])
+
+    def test_month_boundary_cohort_starts_at_jst_midnight_not_utc_midnight(self):
+        self.sighting(["200"], datetime(2026, 9, 30, 14, 59, tzinfo=timezone.utc))
+        self.sighting(["201"], datetime(2026, 9, 30, 15, 0, tzinfo=timezone.utc))
+        self.sighting(["200", "201"], dj="900")
+        result = summary(self.database, self.private, now=self.now)
+        self.assertEqual(result["cohorts"]["monthly_visitor_count"], 1)
+        self.assertEqual(result["daily"][-1]["hours"][12]["visitors"], 1)
+        self.assertEqual(result["totals"]["all"], 1)
+
+    def test_partial_monthly_cohort_and_absent_subgroups_keep_unknown_separate(self):
+        self.import_fans(["200"])
+        self.ranking([("201", 30)], complete=False)
+        self.sighting(["200", "201", "999"], dj="900", complete=False)
+        result = summary(self.database, self.private, now=self.now)
+        cell = result["daily"][-1]["hours"][12]
+        self.assertEqual((cell["all"], cell["fans"], cell["monthly"], cell["visitors"]),
+                         (2, 1, 1, 0))
+        self.assertEqual(result["monthly"]["state"], "partial")
+        self.assertEqual(result["state"], "partial")
+        self.assertTrue(cell["partial"])
+        self.assertIsNone(result["daily"][-1]["hours"][11]["all"])
+
+    def test_individual_activity_counts_listening_across_rooms_not_own_broadcasts(self):
+        self.sighting(["200"], self.now-timedelta(minutes=40), dj="900")
+        self.sighting(["200"], self.now-timedelta(minutes=30), dj="901")
+        self.sighting(["200"], self.now-timedelta(days=1), dj="901")
+        self.sighting(["999"], dj="200")  # Broadcasting alone is not listening.
+        self.sighting(["200"], self.now+timedelta(minutes=1), dj="900")
+        result = user_activity(self.database, "200", now=self.now)
+        self.assertEqual(result["mode"], "individual")
+        self.assertEqual(result["scope"], "individual_across_rooms")
+        self.assertNotIn("cohorts", result)
+        self.assertEqual(result["profile"]["id"], "200")
+        self.assertEqual(result["totals"]["all"], 1)
+        self.assertEqual(result["totals"]["positive_days"], 2)
+        self.assertEqual(result["daily"][-1]["hours"][11]["all"], 1)
+        self.assertEqual(result["daily"][-2]["hours"][12]["all"], 1)
+        self.assertIsNone(result["daily"][-1]["hours"][12]["all"])
+        self.assertEqual(result["totals"]["last_observed_at"],
+                         (self.now-timedelta(minutes=30)).isoformat(timespec="microseconds"))
+
+    def test_individual_known_profile_without_listening_unknown_id_and_validation(self):
+        profiledb.cache_users(self.database, [{"id": "200", "name": "Known", "tag": "known"}],
+                             self.now.isoformat())
+        self.sighting(["999"], dj="200")
+        result = user_activity(self.database, "200", now=self.now)
+        self.assertEqual(result["state"], "not_observed")
+        self.assertIsNone(result["totals"]["all"])
+        self.assertTrue(all(cell["all"] is None for day in result["daily"] for cell in day["hours"]))
+        self.assertIsNone(user_activity(self.database, "404", now=self.now))
+        for value in (None, 200, "", "0", "000", "-1", "１２３", "200 OR 1=1", "1"*201):
+            with self.subTest(user_id=value), self.assertRaises(ValueError):
+                user_activity(self.database, value, now=self.now)
+        for value in (1, True, "7", 7.0):
+            with self.subTest(days=value), self.assertRaises(ValueError):
+                user_activity(self.database, "200", days=value, now=self.now)
+
+    def test_own_cohort_imports_and_activity_reads_do_not_modify_either_database(self):
+        self.import_fans(["200"])
+        self.sighting(["200"], dj="900")
+        before_main, before_private = self.database.read_bytes(), self.private.read_bytes()
+        summary(self.database, self.private, now=self.now)
+        user_activity(self.database, "200", now=self.now)
+        self.assertEqual(self.database.read_bytes(), before_main)
+        self.assertEqual(self.private.read_bytes(), before_private)
+
+    def test_unrelated_partial_room_samples_do_not_leak_counts_or_taint_cohort(self):
+        self.import_fans(["200"])
+        self.sighting(["200"], dj="900")
+        self.sighting(["999"], dj="901", complete=False)
+        self.sighting([], self.now-timedelta(hours=1), dj="902", complete=False)
+        cohort = summary(self.database, self.private, now=self.now)
+        personal = user_activity(self.database, "200", now=self.now)
+        for result in (cohort, personal):
+            self.assertEqual(result["state"], "ready")
+            self.assertEqual(result["totals"]["snapshot_count"], 1)
+            self.assertEqual(result["totals"]["partial_snapshot_count"], 0)
+            cell = result["daily"][-1]["hours"][12]
+            self.assertEqual(cell["snapshot_count"], 1)
+            self.assertFalse(cell["partial"])
+            unknown = result["daily"][-1]["hours"][11]
+            self.assertEqual(unknown["snapshot_count"], 0)
+            self.assertFalse(unknown["partial"])
+            self.assertIsNone(unknown["all"])
 
 
 if __name__ == "__main__":

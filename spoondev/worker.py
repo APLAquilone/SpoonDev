@@ -29,7 +29,7 @@ from . import collection_status
 
 REQUEST_SPACING = 0.4
 REQUESTS_PER_MINUTE = 60
-DISCOVERY_INTERVAL = 10
+DISCOVERY_INTERVAL = 60
 HEARTBEAT_INTERVAL = 5
 HEARTBEAT_FRESH_SECONDS = 30
 
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS worker_state (
  started_at TEXT,heartbeat_at TEXT,stopped_at TEXT,state TEXT NOT NULL DEFAULT 'not_started',
  cooldown_until REAL NOT NULL DEFAULT 0,next_request_at REAL NOT NULL DEFAULT 0,
  window_started_at REAL NOT NULL DEFAULT 0,window_requests INTEGER NOT NULL DEFAULT 0,
- last_error TEXT);
+ last_error TEXT,restart_at REAL);
 INSERT OR IGNORE INTO worker_state(singleton) VALUES(1);
 '''
 
@@ -73,6 +73,10 @@ def initialize(database):
     path.parent.mkdir(parents=True,exist_ok=True)
     with sqlite3.connect(path,timeout=30) as conn:
         conn.executescript(_SCHEMA)
+        # Serialize this additive migration with other startup/enqueue calls.
+        conn.execute('BEGIN IMMEDIATE')
+        if 'restart_at' not in {row[1] for row in conn.execute('PRAGMA table_info(worker_state)')}:
+            conn.execute('ALTER TABLE worker_state ADD COLUMN restart_at REAL')
 
 
 def _table(conn,name):
@@ -118,12 +122,15 @@ def enqueue(database,kind,dj_id=None,priority=50):
 def read_status(conn):
     """Return observed worker heartbeat; a fresh heartbeat is not an uptime guarantee."""
     result={'state':'not_started','worker_running':False,'heartbeat_at':None,
-            'started_at':None,'stopped_at':None,'cooldown_until':None,'pid':None}
+            'started_at':None,'stopped_at':None,'cooldown_until':None,'pid':None,
+            'restart_at':None,'last_error':None}
     if not _table(conn,'worker_state'):return result
-    row=conn.execute('''SELECT state,pid,started_at,heartbeat_at,stopped_at,cooldown_until
-      FROM worker_state WHERE singleton=1''').fetchone()
+    columns={r[1] for r in conn.execute('PRAGMA table_info(worker_state)')}
+    restart='restart_at' if 'restart_at' in columns else 'NULL'
+    row=conn.execute(f'''SELECT state,pid,started_at,heartbeat_at,stopped_at,cooldown_until,
+      {restart},last_error FROM worker_state WHERE singleton=1''').fetchone()
     if row is None:return result
-    state,pid,started,heartbeat,stopped,cooldown=row
+    state,pid,started,heartbeat,stopped,cooldown,restart_at,last_error=row
     recent=False
     if heartbeat and state=='running' and not stopped:
         try:
@@ -134,7 +141,8 @@ def read_status(conn):
                          'running' if recent else 'unconfirmed' if state=='running' else state),
                   worker_running=recent,heartbeat_at=heartbeat,started_at=started,
                   stopped_at=stopped,pid=pid,
-                  cooldown_until=_iso(cooldown) if cooldown>time.time() else None)
+                  cooldown_until=_iso(cooldown) if cooldown>time.time() else None,
+                  restart_at=_iso(restart_at) if restart_at else None,last_error=last_error)
     return result
 
 
@@ -343,7 +351,8 @@ def _attempt(database,job,stop,concurrency,interval):
                         if metadata['state']!='completed':partial_rooms.append(rid)
                     except (ValueError,TypeError,KeyError,sqlite3.Error) as exc:
                         callback_errors.append(f'Room {rid}: {exc}')
-            try:results,errors=collect_spoon(concurrency=concurrency,max_rooms=0,max_pages=100,room_callback=room_finished)
+            try:results,errors=collect_spoon(concurrency=concurrency,max_rooms=0,max_pages=0,
+                                           room_callback=room_finished,stopped_event=stop)
             except SpoonRateLimit as exc:
                 results=[];errors=['HTTP429'];retry=exc.retry_after
             else:retry=0
@@ -401,6 +410,41 @@ def _recover(database):
         if run_id is not None:collection_status.finish(database,run_id,details,failed=True)
 
 
+def _record_task_failure(database,job,exc,interval):
+    """Contain a failed task even if its own error handler did not finish.
+
+    A persistent database error is allowed to escape to the supervisor: it
+    must not keep fetching data that it cannot reliably record.
+    """
+    summary={'complete':False,'errors':[f'Collection task failed ({type(exc).__name__}): {exc}'],
+             'restart_policy':'restart_from_first_page'}
+    run_id=None
+    with sqlite3.connect(database,timeout=30) as conn:
+        row=conn.execute('''SELECT a.id,a.run_id,a.state FROM worker_jobs j
+          LEFT JOIN worker_attempts a ON a.id=j.last_attempt_id
+          WHERE j.kind=? AND j.dj_id=?''',(job['kind'],job['dj_id'])).fetchone()
+        if row and row[2]=='running':
+            conn.execute("UPDATE worker_attempts SET finished_at=?,state='failed',summary=? WHERE id=?",
+                         (_iso(),json.dumps(summary,ensure_ascii=False),row[0]))
+            run_id=row[1]
+        delay=min(interval,60*2**min(job['failure_count'],6))
+        conn.execute("""UPDATE worker_jobs SET state='failed',due_at=?,failure_count=failure_count+1
+          WHERE kind=? AND dj_id=?""",(time.time()+delay,job['kind'],job['dj_id']))
+        conn.execute('UPDATE worker_state SET last_error=? WHERE singleton=1',(summary['errors'][0],))
+    if run_id is not None:collection_status.finish(database,run_id,summary,failed=True)
+    return summary
+
+
+@contextmanager
+def _cancel_on_failure(stop):
+    """Cancel fetching before the executor waits for its unfinished jobs."""
+    try:
+        yield
+    except BaseException:
+        stop.set()
+        raise
+
+
 def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,ranking_interval=3600):
     """Run one supervised worker until stopped; duplicate workers raise explicitly.
 
@@ -420,19 +464,25 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
         _recover(database)
         with sqlite3.connect(database,timeout=30) as conn:
             conn.execute('''UPDATE worker_state SET owner_token=?,pid=?,started_at=?,heartbeat_at=?,
-              stopped_at=NULL,state='running',last_error=NULL WHERE singleton=1''',(token,os.getpid(),_iso(),_iso()))
+              stopped_at=NULL,state='running',last_error=NULL,restart_at=NULL WHERE singleton=1''',(token,os.getpid(),_iso(),_iso()))
         heartbeat_stop=threading.Event()
         def heartbeat():
+            failures=0
             while not heartbeat_stop.wait(HEARTBEAT_INTERVAL):
                 try:
                     with sqlite3.connect(database,timeout=30) as conn:
                         changed=conn.execute('UPDATE worker_state SET heartbeat_at=? WHERE singleton=1 AND owner_token=?',(_iso(),token)).rowcount
                     if not changed:stop.set();return
-                except sqlite3.Error:stop.set();return
+                    failures=0
+                except sqlite3.Error:
+                    failures+=1
+                    # One busy heartbeat must not terminate all collectors.
+                    if failures>=3:stop.set();return
         thread=threading.Thread(target=heartbeat,daemon=True);thread.start()
         futures={};last_discovery=0;budget=_Budget(database,stop,concurrency)
         try:
-            with _budgeted_collectors(budget),ThreadPoolExecutor(max_workers=concurrency) as pool:
+            with (_budgeted_collectors(budget),ThreadPoolExecutor(max_workers=concurrency) as pool,
+                  _cancel_on_failure(stop)):
                 while not stop.is_set():
                     now=time.time()
                     if now-last_discovery>=DISCOVERY_INTERVAL:
@@ -442,7 +492,13 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
                                 conn.execute("UPDATE worker_state SET last_error='Account discovery could not be read.' WHERE singleton=1")
                         last_discovery=now
                     for future in list(futures):
-                        if future.done():future.result();futures.pop(future);attempts+=1
+                        if future.done():
+                            job=futures.pop(future)
+                            try:future.result()
+                            except Exception as exc:
+                                interval=live_interval if job['kind']=='live' else ranking_interval
+                                _record_task_failure(database,job,exc,interval)
+                            attempts+=1
                     if budget.cooldown()<=now:
                         while len(futures)<concurrency and not stop.is_set():
                             job=_claim(database)
@@ -451,7 +507,12 @@ def run(database,auth_database,stop_event=None,concurrency=4,live_interval=300,r
                             future=pool.submit(_attempt,database,job,stop,concurrency,interval)
                             futures[future]=job
                     stop.wait(0.2)
-                for future in futures:future.result();attempts+=1
+                for future,job in futures.items():
+                    try:future.result()
+                    except Exception as exc:
+                        interval=live_interval if job['kind']=='live' else ranking_interval
+                        _record_task_failure(database,job,exc,interval)
+                    attempts+=1
         finally:
             heartbeat_stop.set();thread.join(timeout=2)
             with sqlite3.connect(database,timeout=30) as conn:

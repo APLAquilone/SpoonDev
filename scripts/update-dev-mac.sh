@@ -5,9 +5,9 @@ cd "$(dirname "$0")/.."
 if [[ "$(basename "$PWD")" != *-dev ]]; then
     echo 'Run this script inside the separate SpoonDev-dev checkout'; exit 1
 fi
-dev_branch="${1:-dev/v0.2.2}"
+dev_branch="${1:-dev/v0.3.0}"
 if [[ $# -gt 1 || ! "$dev_branch" =~ ^dev/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo 'Specify a Dev version branch, for example dev/v0.2.2'; exit 1
+    echo 'Specify a Dev version branch, for example dev/v0.3.0'; exit 1
 fi
 python - <<'PY'
 import sys

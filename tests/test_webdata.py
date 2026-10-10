@@ -206,4 +206,175 @@ class WebDataTests(unittest.TestCase):
                 self.assertEqual(result['activity'],'recent');self.assertEqual(result['q'],'%')
                 self.assertEqual([row['id'] for row in result['fans']],['200'])
 
+    def test_latest_temperature_and_absence_downgrade_current_fans(self):
+        from spoondev import fans, profiledb, webdata
+        profiledb.initialize(self.path);fans.initialize(self.path)
+        followers=[{'id':str(uid),'name':str(uid)} for uid in range(400,408)]
+        fans.import_followers(self.path,{'owner':{'id':'10','name':'owner'},
+                                       'followers':followers,'complete':True})
+        now=datetime.now(timezone.utc)
+        def observe(room,minutes,listeners,complete=True,dj='100'):
+            return save_snapshot(self.path,{'room_id':room,'broadcaster':{'id':dj,'name':'host'},
+                'listeners':[{'id':str(uid),'name':str(uid),'favorite_temperature':temperature}
+                             for uid,temperature in listeners],
+                'complete':complete,'observed_at':(now-timedelta(minutes=minutes)).isoformat()})
+        observe('first',8,[(400,20),(401,30),(402,40),(403,0)])
+        observe('first',4,[(400,None),(402,41),(403,0)])
+        observe('partial-room',7,[(404,20)],dj='101')
+        observe('partial-room',3,[],complete=False,dj='101')
+        observe('old',35,[(405,20)],dj='102')
+        observe('future',-2,[(406,20)],dj='103')
+        observe('temperature-missing',2,[(407,None)],dj='104')
+        result=webdata.fan_destinations(self.path,'10')
+        states={row['id']:row['activity_state'] for row in result['fans']}
+        self.assertEqual(states,{'400':'recent','401':'recent','402':'current','403':'current',
+                                 '404':'recent','405':'registered','406':'registered','407':'recent'})
+        self.assertEqual(result['activity_counts'],{'current':2,'recent':4,'registered':2})
+        self.assertEqual(result['category_counts'],result['activity_counts'])
+        self.assertEqual(result['current_seconds'],600)
+        rows={row['id']:row for row in result['fans']}
+        self.assertIsNone(rows['400']['live'][0]['favorite_temperature'])
+        self.assertEqual(rows['403']['live'][0]['favorite_temperature'],0)
+        self.assertIsNone(rows['406']['last_live_at'])
+        self.assertEqual({row['id'] for row in webdata.fan_destinations(self.path,'10',activity='current')['fans']},
+                         {'402','403'})
+        recent=webdata.fan_destinations(self.path,'10',activity='recent')
+        self.assertEqual(recent['total'],6)  # Current observations also satisfy the recent filter.
+        activity=webdata.favorite_activity(self.path,['400','401','402','403','404','405','406','407'])
+        self.assertEqual({row['id']:row['activity_state'] for row in activity['users']},states)
+
+    def test_fan_category_priority_is_applied_before_sort_and_page(self):
+        from spoondev import fans, profiledb, webdata
+        profiledb.initialize(self.path);fans.initialize(self.path)
+        followers=[{'id':str(i),'name':f'A old {i}'} for i in range(400,455)]
+        followers.extend([{'id':'900','name':'Z current'},{'id':'901','name':'Y recent'}])
+        fans.import_followers(self.path,{'owner':{'id':'10','name':'owner'},'followers':followers,'complete':True})
+        now=datetime.now(timezone.utc)
+        for uid,minutes,temp in [('900',2,10),('901',20,20)]:
+            save_snapshot(self.path,{'room_id':uid,'broadcaster':{'id':uid+'0','name':'host'},
+                'listeners':[{'id':uid,'name':'Z current' if uid=='900' else 'Y recent',
+                              'favorite_temperature':temp}],
+                'complete':True,'observed_at':(now-timedelta(minutes=minutes)).isoformat()})
+        first=webdata.fan_destinations(self.path,'10',sort='name',limit=2)
+        second=webdata.fan_destinations(self.path,'10',sort='name',limit=2,offset=2)
+        self.assertEqual([row['id'] for row in first['fans']],['900','901'])
+        self.assertEqual([row['activity_state'] for row in second['fans']],['registered','registered'])
+        self.assertEqual(first['activity_counts'],{'current':1,'recent':1,'registered':55})
+        self.assertEqual(second['activity_counts'],first['activity_counts'])
+        self.assertEqual(first['total'],57)
+        only_old=webdata.fan_destinations(self.path,'10',activity='registered')
+        self.assertEqual(only_old['total'],55)
+        self.assertEqual(only_old['activity_counts']['current'],0)
+
+    def test_new_room_invalidates_old_presence_but_other_dj_can_be_current(self):
+        from spoondev.webdata import favorite_activity
+        now=datetime.now(timezone.utc)
+        def observe(room,dj,minutes,listeners):
+            save_snapshot(self.path,{'room_id':room,'broadcaster':{'id':dj,'name':'host'},
+                'listeners':[{'id':uid,'name':'listener','favorite_temperature':20} for uid in listeners],
+                'complete':True,'observed_at':(now-timedelta(minutes=minutes)).isoformat()})
+        observe('old-room','100',8,['400','401'])
+        observe('new-room','100',4,[])
+        observe('other-dj','101',5,['401'])
+        observe('future-room','101',-2,[])
+        result={row['id']:row for row in favorite_activity(self.path,['400','401'])['users']}
+        self.assertEqual(result['400']['activity_state'],'recent')
+        self.assertEqual(result['401']['activity_state'],'current')
+
+    def test_observation_range_is_latest_session_and_preserves_missing_temperature(self):
+        now=datetime.now(timezone.utc)
+        def observe(room,minutes,present=True,temperature=20,complete=True):
+            save_snapshot(self.path,{'room_id':room,'broadcaster':{'id':'100','name':'host'},
+                'listeners':[{'id':'200','name':'listener','favorite_temperature':temperature}] if present else [],
+                'complete':complete,'observed_at':(now-timedelta(minutes=minutes)).isoformat()})
+        observe('range',50)
+        observe('range',10);observe('range',8)
+        observe('range',7,present=False)
+        observe('range',6);observe('range',5)
+        relation=user_details(self.path,'200')['broadcasters'][0]
+        self.assertEqual(relation['first_seen_at'],(now-timedelta(minutes=6)).isoformat(timespec='microseconds'))
+        self.assertEqual(relation['last_seen_at'],(now-timedelta(minutes=5)).isoformat(timespec='microseconds'))
+        self.assertEqual(relation['session_observation_count'],2)
+        self.assertNotEqual(relation['first_seen_at'],relation['all_time_first_seen_at'])
+        observe('new-range',3,temperature=50)
+        observe('new-range',2,temperature=None,complete=False)
+        relation=user_details(self.path,'200')['broadcasters'][0]
+        self.assertEqual(relation['first_seen_at'],(now-timedelta(minutes=3)).isoformat(timespec='microseconds'))
+        self.assertIsNone(relation['favorite_temperature'])
+        self.assertFalse(relation['observation_range_complete'])
+        self.assertEqual(relation['observed_from_at'],relation['first_seen_at'])
+        self.assertEqual(relation['observed_until_at'],relation['last_seen_at'])
+
+    def test_observation_range_can_cross_calendar_midnight_but_long_gap_starts_again(self):
+        from unittest.mock import patch
+        from spoondev import webdata
+        now=datetime(2026,10,11,0,15,tzinfo=timezone.utc)
+        for stamp in ('2026-10-10T23:55:00Z','2026-10-11T00:05:00Z'):
+            save_snapshot(self.path,{'room_id':'midnight','broadcaster':{'id':'100','name':'host'},
+                'listeners':[{'id':'200','name':'listener'}],'complete':True,'observed_at':stamp})
+        with patch.object(webdata,'datetime',wraps=datetime) as clock:
+            clock.now.return_value=now
+            row=user_details(self.path,'200')['broadcasters'][0]
+        self.assertEqual(row['first_seen_at'],'2026-10-10T23:55:00.000000+00:00')
+        self.assertEqual(row['last_seen_at'],'2026-10-11T00:05:00.000000+00:00')
+        save_snapshot(self.path,{'room_id':'midnight','broadcaster':{'id':'100','name':'host'},
+            'listeners':[{'id':'200','name':'listener'}],'complete':True,'observed_at':'2026-10-11T00:30:00Z'})
+        with patch.object(webdata,'datetime',wraps=datetime) as clock:
+            clock.now.return_value=datetime(2026,10,11,0,35,tzinfo=timezone.utc)
+            row=user_details(self.path,'200')['broadcasters'][0]
+        self.assertEqual(row['first_seen_at'],row['last_seen_at'])
+
+    def test_favorite_previews_are_batched_and_future_monthly_ranking_is_excluded(self):
+        from spoondev import profiledb, webdata
+        profiledb.initialize(self.path)
+        now=datetime.now(timezone.utc)
+        month=now.astimezone(__import__('zoneinfo').ZoneInfo('Asia/Tokyo')).strftime('%Y-%m')
+        profiledb.save_dj_ranking(self.path,{'id':'100','name':'host'},
+            [{'user':{'id':'200','name':'listener'},'temperature':42}],month,True,
+            observed_at=(now-timedelta(minutes=5)).isoformat())
+        profiledb.save_dj_ranking(self.path,{'id':'100','name':'host'},[],month,True,
+            observed_at=(now+timedelta(minutes=5)).isoformat())
+        save_snapshot(self.path,{'room_id':'preview','broadcaster':{'id':'100','name':'host'},
+            'listeners':[{'id':'200','name':'listener','favorite_temperature':45}],
+            'complete':True,'observed_at':(now-timedelta(minutes=2)).isoformat()})
+        result=webdata.favorite_activity(self.path,['200','404'])
+        self.assertEqual(result['users'][0]['monthly'][0]['temperature'],42)
+        self.assertEqual(result['users'][0]['live'][0]['favorite_temperature'],45)
+        self.assertEqual(result['users'][1]['monthly'],[])
+        self.assertEqual(result['users'][1]['live'],[])
+
+    def test_compact_preview_is_bounded_but_detail_keeps_full_observed_range(self):
+        from unittest.mock import patch
+        from spoondev import webdata
+        now=datetime.now(timezone.utc)
+        # A long series should remain a full detail range, while list polling
+        # only needs points from the advertised recent observation window.
+        for minutes in (60,50,40,30,20,10,2):
+            save_snapshot(self.path,{'room_id':'continuous-samples',
+                'broadcaster':{'id':'100','name':'host'},
+                'listeners':[{'id':'200','name':'listener','favorite_temperature':20}],
+                'complete':True,'observed_at':(now-timedelta(minutes=minutes)).isoformat()})
+        with patch.object(webdata,'datetime',wraps=datetime) as clock:
+            clock.now.return_value=now
+            preview=webdata.favorite_activity(self.path,['200'])['users'][0]['live'][0]
+            detail=webdata.user_details(self.path,'200')['broadcasters'][0]
+        self.assertEqual(preview['observed_from_at'],(now-timedelta(minutes=30)).isoformat(timespec='microseconds'))
+        self.assertEqual(detail['observed_from_at'],(now-timedelta(minutes=60)).isoformat(timespec='microseconds'))
+        self.assertEqual(preview['session_observation_count'],4)
+        self.assertEqual(detail['session_observation_count'],7)
+        self.assertIn('直近30分',preview['observation_range_note'])
+        self.assertNotIn('observation_window_start_at',detail)
+
+    def test_empty_fan_page_retains_counts_and_no_query_count_fields_leak(self):
+        from spoondev import fans, profiledb, webdata
+        profiledb.initialize(self.path);fans.initialize(self.path)
+        fans.import_followers(self.path,{'owner':{'id':'10','name':'owner'},
+            'followers':[{'id':'200','name':'listener'}],'complete':True})
+        first=webdata.fan_destinations(self.path,'10',limit=1)
+        beyond=webdata.fan_destinations(self.path,'10',limit=1,offset=100)
+        self.assertEqual(beyond['fans'],[])
+        self.assertEqual(beyond['total'],first['total'])
+        self.assertEqual(beyond['category_counts'],first['category_counts'])
+        self.assertFalse(any(key.startswith('count_') for key in first['fans'][0]))
+
 if __name__=='__main__': unittest.main()

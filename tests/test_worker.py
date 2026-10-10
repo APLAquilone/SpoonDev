@@ -373,6 +373,47 @@ class WorkerTests(unittest.TestCase):
         with self.assertRaises(ValueError):worker.run(dest, empty)
         self.assertFalse(dest.exists())
 
+    def test_unhandled_task_failure_does_not_stop_other_collection_jobs(self):
+        stop=threading.Event();original=worker._attempt
+        def attempt(database,job,*args):
+            if job['kind']=='gifts':raise RuntimeError('Unexpected task crash')
+            return original(database,job,*args)
+        def live(**kwargs):
+            stop.set()
+            return [],[]
+        with patch('spoondev.worker._attempt',side_effect=attempt), \
+                patch('spoondev.worker.collect_monthly',return_value={'complete':True,'dj_count':1,'errors':[]}), \
+                patch('spoondev.worker.collect_spoon',side_effect=live):
+            result=worker.run(self.database,self.auth,stop_event=stop,concurrency=1)
+        self.assertEqual(result['attempt_count'],3)
+        jobs={(j['kind'],j['dj_id']):j for j in self.jobs()}
+        self.assertEqual(jobs['gifts','10']['state'],'failed')
+        self.assertEqual(jobs['monthly','10']['last_attempt']['state'],'completed')
+        self.assertEqual(jobs['live','']['last_attempt']['state'],'completed')
+        self.assertGreater(datetime.fromisoformat(jobs['gifts','10']['next_due_at']).timestamp(),time.time()+50)
+        with sqlite3.connect(self.database) as conn:
+            self.assertIn('Unexpected task crash',worker.read_status(conn)['last_error'])
+
+    def test_scheduler_failure_cancels_fetching_before_executor_wait(self):
+        stop=threading.Event();started=threading.Event();cancelled=[];checks=[]
+        def attempt(*args):
+            started.set()
+            cancelled.append(stop.wait(1))
+            return {'complete':False,'errors':['Collection stopped']}
+        def cooldown():
+            checks.append(True)
+            if len(checks)==1:return 0
+            self.assertTrue(started.wait(1))
+            raise sqlite3.OperationalError('Database became unavailable')
+        with patch('spoondev.worker._attempt',side_effect=attempt), \
+                patch('spoondev.worker._Budget.cooldown',side_effect=cooldown):
+            with self.assertRaisesRegex(sqlite3.OperationalError,'Database became unavailable'):
+                worker.run(self.database,self.auth,stop_event=stop,concurrency=1)
+        self.assertEqual(cancelled,[True])
+        self.assertTrue(stop.is_set())
+        with sqlite3.connect(self.database) as conn:
+            self.assertEqual(worker.read_status(conn)['state'],'stopped')
+
 
 if __name__ == '__main__':
     unittest.main()

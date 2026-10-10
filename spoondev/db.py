@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS user_attributes (
  PRIMARY KEY(snapshot_id,user_id));
 CREATE INDEX IF NOT EXISTS snapshots_broadcaster ON snapshots(broadcaster_id,observed_at);
 CREATE INDEX IF NOT EXISTS snapshots_room ON snapshots(broadcaster_id,room_id,observed_at);
+CREATE INDEX IF NOT EXISTS snapshots_observed ON snapshots(observed_at,id);
 CREATE INDEX IF NOT EXISTS memberships_listener ON memberships(listener_id,snapshot_id);
 CREATE INDEX IF NOT EXISTS user_attributes_user ON user_attributes(user_id,snapshot_id);
 CREATE TABLE IF NOT EXISTS observation_attempts (
@@ -35,7 +36,7 @@ CREATE INDEX IF NOT EXISTS observation_attempts_room ON observation_attempts(roo
 @contextmanager
 def _connection(database):
     owned = not isinstance(database, sqlite3.Connection)
-    conn = sqlite3.connect(database) if owned else database
+    conn = sqlite3.connect(database, timeout=30) if owned else database
     conn.execute('PRAGMA foreign_keys=ON')
     try:
         yield conn
