@@ -17,7 +17,8 @@ from spoondev import supervisor,worker
 class SupervisorTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
-        self.root=Path(self.temp.name)
+        # The service installer stores canonical paths, including on macOS.
+        self.root=Path(self.temp.name).resolve()
         self.db=self.root/'data/spoondev.sqlite3';worker.initialize(self.db)
         self.stop=threading.Event()
 
@@ -103,6 +104,20 @@ class SupervisorTests(unittest.TestCase):
             run.return_value=subprocess.CompletedProcess([],1,'')
             self.assertFalse(supervisor.service_loaded(self.root,self.db))
             self.assertEqual(run.call_count,1)
+
+    def test_canonical_service_marker_is_recognized_through_a_checkout_symlink(self):
+        alias=self.root/'checkout alias';alias.symlink_to(self.root,target_is_directory=True)
+        config={'label':'net.spooninsights.collector.'+'a'*12,'root':str(self.root),'db':str(self.db)}
+        (self.root/'data/collector-service.json').write_text(json.dumps(config))
+        with patch('spoondev.supervisor.subprocess.run') as run:
+            run.return_value=subprocess.CompletedProcess([],0,'state = running\npid = 123\n')
+            self.assertTrue(supervisor.service_loaded(alias,alias/'data/spoondev.sqlite3'))
+            self.assertEqual(run.call_count,1)
+            self.assertEqual(run.call_args.args[0],
+                             ['launchctl','print',f'gui/{os.getuid()}/{config["label"]}'])
+            run.reset_mock()
+            self.assertFalse(supervisor.service_loaded(alias,alias/'data/other.sqlite3'))
+            run.assert_not_called()
 
     def test_existing_worker_schema_gets_additive_restart_column(self):
         legacy=self.root/'legacy.sqlite3'
