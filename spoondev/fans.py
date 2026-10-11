@@ -1,6 +1,6 @@
 """Owner-provided follower lists; no Spoon login credentials are stored."""
-import sqlite3
 from . import profiledb
+from .db import _connection
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS fan_owners (
@@ -14,7 +14,7 @@ CREATE INDEX IF NOT EXISTS registered_fans_user ON registered_fans(user_id,owner
 
 
 def initialize(database):
-    with sqlite3.connect(database) as conn:
+    with _connection(database) as conn:
         conn.executescript(SCHEMA)
 
 
@@ -56,8 +56,7 @@ def import_followers(database,payload):
             raise ValueError('同じ数値IDに異なる名前が指定されています。')
         canonical[user['id']]=user
     stamp=profiledb._timestamp(None)
-    with sqlite3.connect(database) as conn:
-        conn.execute('PRAGMA foreign_keys=ON')
+    with _connection(database) as conn, profiledb._atomic(conn):
         conn.execute('''INSERT INTO fan_owners VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
           name=excluded.name,tag=excluded.tag,imported_at=excluded.imported_at,complete=excluded.complete''',
           (owner['id'],owner['name'],owner['tag'],stamp,int(complete)))
@@ -78,7 +77,35 @@ def clear_followers(database, payload):
     if not isinstance(payload, dict) or payload.get('confirm') is not True:
         raise ValueError('登録ファンの全削除を確認してください。')
     owner_id = numeric_id(payload.get('owner_id'))
-    with sqlite3.connect(database) as conn:
+    with _connection(database) as conn, profiledb._atomic(conn):
         deleted = conn.execute('DELETE FROM registered_fans WHERE owner_id=?', (owner_id,)).rowcount
         conn.execute('DELETE FROM fan_owners WHERE id=?', (owner_id,))
     return {'owner_id': owner_id, 'deleted_count': deleted, 'fan_count': 0}
+
+
+def remove_follower(database, payload):
+    """Remove one owner-provided relation, keeping the owner's other settings.
+
+    Unlike ``clear_followers``, an empty resulting list still has its owner
+    registration. A manually edited full export is no longer a complete list;
+    its original import timestamp and cached profiles remain unchanged.
+    """
+    if not isinstance(payload, dict) or payload.get('confirm') is not True:
+        raise ValueError('このファンの登録解除を確認してください。')
+    owner_id = numeric_id(payload.get('owner_id'))
+    user_id = numeric_id(payload.get('user_id'))
+    removed_at = None
+    with _connection(database) as conn, profiledb._atomic(conn):
+        deleted = conn.execute(
+            'DELETE FROM registered_fans WHERE owner_id=? AND user_id=?',
+            (owner_id, user_id),
+        ).rowcount
+        if deleted:
+            conn.execute('UPDATE fan_owners SET complete=0 WHERE id=?', (owner_id,))
+            removed_at = profiledb._timestamp(None)
+        owner = conn.execute('SELECT complete FROM fan_owners WHERE id=?', (owner_id,)).fetchone()
+        count = conn.execute('SELECT COUNT(*) FROM registered_fans WHERE owner_id=?',
+                             (owner_id,)).fetchone()[0]
+    return {'owner_id': owner_id, 'user_id': user_id, 'deleted_count': deleted,
+            'fan_count': count, 'complete': bool(owner[0]) if owner else False,
+            'removed_at': removed_at}

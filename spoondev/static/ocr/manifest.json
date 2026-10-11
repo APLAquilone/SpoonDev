@@ -1,0 +1,39 @@
+{
+  "licenses": [
+    "Apache-2.0",
+    "See worker.min.js.LICENSE.txt for bundled dependency notices"
+  ],
+  "tesseract_js_version": "6.0.1",
+  "tesseract_js_core_version": "6.0.0",
+  "tessdata_fast_version": "4.1.0",
+  "npm_tarball_integrity": {
+    "tesseract.js": "sha512-/sPvMvrCtgxnNRCjbTYbr7BRu0yfWDsMZQ2a/T5aN/L1t8wUQN6tTWv6p6FwzpoEBA0jrN2UD2SX4QQFRdoDbA==",
+    "tesseract.js-core": "sha512-1Qncm/9oKM7xgrQXZXNB+NRh19qiXGhxlrR8EwFbK5SaUbPZnS5OMtP/ghtqfd23hsr1ZvZbZjeuAGcMxd/ooA=="
+  },
+  "assets": {
+    "worker.min.js": {
+      "source": "https://registry.npmjs.org/tesseract.js/-/tesseract.js-6.0.1.tgz",
+      "sha256": "38645599043239c0eb6db08a6504a92dcdc292200535f3e9339cd77c4443b842",
+      "size": 111162
+    },
+    "tesseract-core-lstm.wasm.js": {
+      "source": "https://registry.npmjs.org/tesseract.js-core/-/tesseract.js-core-6.0.0.tgz",
+      "sha256": "775a35df6f2ae100e02609443e6bd5cafcd07983dd6175454ca4a432a7730687",
+      "size": 3954181
+    },
+    "jpn.traineddata.gz": {
+      "source": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/jpn.traineddata",
+      "sha256": "e63ef6c7bab048da264712946a674009b258f64b501d803bb70b95352763048f",
+      "size": 1519725,
+      "upstream_sha256": "1f5de9236d2e85f5fdf4b3c500f2d4926f8d9449f28f5394472d9e8d83b91b4d",
+      "processing": "gzip compression with mtime=0"
+    },
+    "eng.traineddata.gz": {
+      "source": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/eng.traineddata",
+      "sha256": "f1c22599ed6fd3eb821d87fdb43e09f98b61179a4abe38c43cfca2cdcb9f5ec2",
+      "size": 1967599,
+      "upstream_sha256": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
+      "processing": "gzip compression with mtime=0"
+    }
+  }
+}

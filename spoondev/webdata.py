@@ -6,6 +6,7 @@ error and can never silently become an empty database.
 from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
+import math
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from . import profiledb
@@ -18,13 +19,19 @@ OBSERVATION_GAP_SECONDS = 15 * 60
 OBSERVATION_RANGE_NOTE = '観測された時間の範囲です。連続した滞在時間ではありません。'
 
 
-def _activity_ctes(target_sql):
+def _activity_ctes(target_sql, *, include_room_attempts=True):
     """Presence estimates use the newest saved observation, never a cached temperature.
 
     A newer observation of the same DJ also invalidates an older room. A missing
     listener in a partial observation remains unknown, so it cannot qualify as
     current; its positive, recent observation remains available below.
     """
+    attempt_guard = '''AND NOT EXISTS (SELECT 1 FROM observation_attempts attempted
+          WHERE attempted.broadcaster_id=s.broadcaster_id
+            AND attempted.finished_at>=s.observed_at AND attempted.finished_at<=:now
+            AND (attempted.finished_at>s.observed_at OR attempted.id>COALESCE(
+              (SELECT recorded.id FROM observation_attempts recorded WHERE recorded.snapshot_id=s.id),0))
+            AND attempted.state IN ('failed','partial'))''' if include_room_attempts else ''
     return f'''target_ids AS ({target_sql}), observations AS (
       SELECT m.listener_id,MAX(s.observed_at) AS last_live_at
       FROM target_ids t JOIN memberships m ON m.listener_id=t.id
@@ -35,6 +42,8 @@ def _activity_ctes(target_sql):
       JOIN user_attributes a ON a.snapshot_id=s.id AND a.user_id=m.listener_id
       WHERE s.observed_at>=:current_cutoff AND s.observed_at<=:now
         AND a.favorite_temperature IS NOT NULL
+        AND (s.complete=1 OR s.observed_at>=:default_current_cutoff)
+        {attempt_guard}
         AND NOT EXISTS (SELECT 1 FROM snapshots newer
           WHERE newer.broadcaster_id=s.broadcaster_id AND newer.observed_at<=:now
             AND (newer.observed_at>s.observed_at OR
@@ -50,10 +59,83 @@ def _activity_ctes(target_sql):
       LEFT JOIN current_observations c ON c.listener_id=t.id)'''
 
 
-def _activity_parameters(now):
+def _current_observation_window(conn, now):
+    """Bound fresh presence estimates by a healthy collector's actual cadence.
+
+    Early rooms can age beyond ten minutes before a normal scan is repeated.
+    Only a completed scan from this worker's lifetime can justify extra time.
+    Heartbeats alone, failed/partial work, and stale schedules never do.
+    The result is a freshness window for recorded sightings, not live proof.
+    """
+    from .worker import HEARTBEAT_FRESH_SECONDS
+    required = {'worker_state', 'worker_jobs', 'worker_attempts', 'collection_runs'}
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?,?,?)",
+        tuple(sorted(required)))}
+    if tables != required:
+        return CURRENT_SECONDS
+    row = conn.execute('''SELECT w.state,w.started_at,w.heartbeat_at,w.stopped_at,
+        w.cooldown_until,j.state,a.id,a.state,a.started_at,a.finished_at,
+        previous.id,previous.started_at,previous.finished_at,r.interval_seconds,r.state
+        FROM worker_state w JOIN worker_jobs j ON j.kind='live' AND j.dj_id=''
+        LEFT JOIN worker_attempts a ON a.id=j.last_attempt_id
+        LEFT JOIN worker_attempts previous ON previous.id=(
+          SELECT id FROM worker_attempts WHERE kind='live' AND dj_id=''
+            AND state='completed' AND finished_at<=? ORDER BY id DESC LIMIT 1)
+        LEFT JOIN collection_runs r ON r.id=previous.run_id
+        WHERE w.singleton=1''', (now.isoformat(timespec='microseconds'),)).fetchone()
+    if row is None:
+        return CURRENT_SECONDS
+    def timestamp(value):
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError('A collector timestamp needs a timezone')
+        return parsed.timestamp()
+    try:
+        (worker_state, worker_started, heartbeat, stopped, cooldown, job_state,
+         attempt_id, attempt_state, attempt_started, attempt_finished,
+         previous_id, previous_started, previous_finished, interval, run_state) = row
+        current_time = now.timestamp()
+        worker_started = timestamp(worker_started)
+        heartbeat_age = current_time - timestamp(heartbeat)
+        if (worker_state != 'running' or stopped is not None or
+                not 0 <= heartbeat_age <= HEARTBEAT_FRESH_SECONDS or
+                not math.isfinite(cooldown) or cooldown > current_time or
+                job_state not in ('running', 'completed') or attempt_state != job_state or
+                run_state != 'completed'):
+            return CURRENT_SECONDS
+        previous_started = timestamp(previous_started)
+        previous_finished = timestamp(previous_finished)
+        if not worker_started <= previous_started < previous_finished <= current_time:
+            return CURRENT_SECONDS
+        if type(interval) not in (int, float) or not math.isfinite(interval) or interval < 30:
+            return CURRENT_SECONDS
+        cadence = previous_finished - previous_started + interval
+        # A fresh heartbeat must not extend old state when live work stalls.
+        if job_state == 'completed':
+            if attempt_id != previous_id or current_time > previous_finished + cadence:
+                return CURRENT_SECONDS
+            if timestamp(attempt_finished) != previous_finished:
+                return CURRENT_SECONDS
+        else:
+            started = timestamp(attempt_started)
+            if (attempt_finished is not None or not previous_finished <= started <= current_time or
+                    current_time - started > cadence):
+                return CURRENT_SECONDS
+        return min(RECENT_SECONDS, max(CURRENT_SECONDS, cadence))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return CURRENT_SECONDS
+
+
+def _has_room_attempts(conn):
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observation_attempts'").fetchone() is not None
+
+
+def _activity_parameters(now, current_seconds=CURRENT_SECONDS):
     return {'now':now.isoformat(timespec='microseconds'),
             'recent_cutoff':(now-timedelta(seconds=RECENT_SECONDS)).isoformat(timespec='microseconds'),
-            'current_cutoff':(now-timedelta(seconds=CURRENT_SECONDS)).isoformat(timespec='microseconds')}
+            'current_cutoff':(now-timedelta(seconds=current_seconds)).isoformat(timespec='microseconds'),
+            'default_current_cutoff':(now-timedelta(seconds=CURRENT_SECONDS)).isoformat(timespec='microseconds')}
 
 
 def _latest_observation_sessions(conn, user_ids, now, *, since=None):
@@ -299,13 +381,15 @@ def favorite_activity(database, user_ids):
     user_ids=list(dict.fromkeys(user_ids))
     now=datetime.now(timezone.utc)
     users=[]
+    current_seconds=CURRENT_SECONDS
     if user_ids:
-        parameters=_activity_parameters(now)
-        parameters.update({f'uid{i}':uid for i,uid in enumerate(user_ids)})
         target_sql=' UNION ALL '.join(f'SELECT :uid{i} AS id' for i in range(len(user_ids)))
         with _read(database) as conn:
             conn.execute('BEGIN')
-            rows=conn.execute('WITH '+_activity_ctes(target_sql)+
+            current_seconds=_current_observation_window(conn,now)
+            parameters=_activity_parameters(now,current_seconds)
+            parameters.update({f'uid{i}':uid for i,uid in enumerate(user_ids)})
+            rows=conn.execute('WITH '+_activity_ctes(target_sql,include_room_attempts=_has_room_attempts(conn))+
                 ', profiles AS ('+_profiles(conn,'SELECT id FROM target_ids')+') SELECT a.*,p.name,p.tag FROM activity_rows a '
                 'LEFT JOIN profiles p ON p.id=a.id',parameters).fetchall()
             by_id={row['id']:dict(row) for row in rows}
@@ -317,7 +401,8 @@ def favorite_activity(database, user_ids):
     counts={state:sum(user['activity_state']==state for user in users)
             for state in ('current','recent','registered')}
     return {'users':users,'checked_at':now.isoformat(),'recent_minutes':RECENT_SECONDS/60,
-            'recent_seconds':RECENT_SECONDS,'current_seconds':CURRENT_SECONDS,
+            'recent_seconds':RECENT_SECONDS,'current_seconds':current_seconds,
+            'current_window_basis':'observed_scan_cadence' if current_seconds>CURRENT_SECONDS else 'fixed_window',
             'activity_counts':counts,'category_counts':counts,'destinations_limit':5}
 
 
@@ -352,17 +437,20 @@ def fan_destinations(database, owner_id, offset=0, limit=50, private_database=No
               'current_seconds':CURRENT_SECONDS,'destinations_limit':5}
     with _read(database, private_database) as conn:
         conn.execute('BEGIN')
+        current_seconds=_current_observation_window(conn,now)
+        metadata['current_seconds']=current_seconds
+        metadata['current_window_basis']='observed_scan_cadence' if current_seconds>CURRENT_SECONDS else 'fixed_window'
         owner=conn.execute('SELECT * FROM fan_owners WHERE id=?',(owner_id,)).fetchone()
         if owner is None:
             return dict(metadata,owner=None,fans=[],has_more=False,registered_count=0,total=0,
                         activity_counts=counts,category_counts=counts)
         registered_count=conn.execute('SELECT COUNT(*) FROM registered_fans WHERE owner_id=?',(owner_id,)).fetchone()[0]
         target_sql='SELECT user_id AS id FROM registered_fans WHERE owner_id=:owner'
-        base='WITH '+_activity_ctes(target_sql)+', profiles AS ('+_profiles(conn,'SELECT id FROM target_ids')+'''), fan_rows AS (
+        base='WITH '+_activity_ctes(target_sql,include_room_attempts=_has_room_attempts(conn))+', profiles AS ('+_profiles(conn,'SELECT id FROM target_ids')+'''), fan_rows AS (
           SELECT a.*,COALESCE(p.name,f.name,'名前未取得') AS name,COALESCE(p.tag,f.tag) AS tag
           FROM activity_rows a JOIN registered_fans f ON f.user_id=a.id AND f.owner_id=:owner
           LEFT JOIN profiles p ON p.id=f.user_id) '''
-        parameters=dict(_activity_parameters(now),owner=owner_id)
+        parameters=dict(_activity_parameters(now,current_seconds),owner=owner_id)
         conditions=[]
         if q:
             conditions.append("(id LIKE :pattern ESCAPE '\\' OR name LIKE :pattern ESCAPE '\\' OR tag LIKE :pattern ESCAPE '\\')")

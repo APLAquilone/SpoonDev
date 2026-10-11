@@ -2,10 +2,11 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import hmac
+import hashlib
 import threading
 import time
 from http.cookies import SimpleCookie
-from . import accounts, __version__
+from . import accounts, db, __version__
 from pathlib import Path
 import sqlite3
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -46,6 +47,7 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
     database = str(Path(database).resolve())
     if not Path(database).is_file():
         raise FileNotFoundError('Database not found; run init-db or collect-spoon first')
+    db.initialize(database)
     profiledb.initialize(database)
     fans.initialize(database)
     from . import worker
@@ -57,12 +59,14 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 body = json.dumps(body, ensure_ascii=False, allow_nan=False).encode('utf-8')
             self.send_response(status)
             self.send_header('Content-Type', content_type)
-            self.send_header('Content-Length', str(len(body)))
-            self.send_header('Cache-Control', 'no-store')
+            if status not in (204,304):
+                self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', (headers or {}).get('Cache-Control','no-store'))
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
-            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
-            for key,value in (headers or {}).items(): self.send_header(key,value)
+            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+            for key,value in (headers or {}).items():
+                if key.lower()!='cache-control': self.send_header(key,value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -189,6 +193,18 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
             if auth and path=='/api/dashboard':
                 from .dashboard import summary
                 self.respond(200,summary(database,self.private_db));return
+            if path=='/api/dashboard/listener-followup':
+                if not auth:
+                    self.respond(401,{'error':'ログインしてください。'});return
+                query=parse_qs(urlsplit(self.path).query,max_num_fields=3,keep_blank_values=True)
+                if set(query)-{'user_id','limit','before_id'} or any(len(v)!=1 for v in query.values()):
+                    raise ValueError('Invalid listener followup parameter')
+                user_id=fans.numeric_id(query.get('user_id',[''])[0])
+                limit=int(query.get('limit',['30'])[0])
+                before_id=int(query['before_id'][0]) if 'before_id' in query else None
+                from .dashboard import listener_followup
+                self.respond(200,listener_followup(database,self.private_db,user_id,
+                    limit=limit,before_id=before_id));return
             if path=='/api/analytics':
                 if not auth:
                     self.respond(401,{'error':'時間帯別の集計にはログインが必要です。'});return
@@ -254,11 +270,44 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                         q=query.get('q',[''])[0], activity=query.get('activity',['all'])[0])
                     if auth and self.user['username']!='kitomoya':result.pop('indexed_djs',None)
                     self.respond(200,result)
+                elif route.path == '/api/fans/candidates':
+                    if not auth:
+                        self.respond(401,{'error':'ログインしてください。'});return
+                    candidate_query=parse_qs(route.query,max_num_fields=7,keep_blank_values=True)
+                    if set(candidate_query)-{'owner_id','source','offset','limit','q','sort','activity'} or any(len(v)!=1 for v in candidate_query.values()):
+                        raise ValueError('Invalid fan candidates parameter')
+                    owner_id=fans.numeric_id(candidate_query.get('owner_id',[''])[0])
+                    self.fan_scope(owner_id)
+                    from .fan_cohorts import candidates
+                    self.respond(200,candidates(database,owner_id,private_database=self.private_db,
+                        source=candidate_query.get('source',['observed'])[0],
+                        offset=int(candidate_query.get('offset',['0'])[0]),limit=int(candidate_query.get('limit',['50'])[0]),
+                        q=candidate_query.get('q',[''])[0],sort=candidate_query.get('sort',['recent'])[0],
+                        activity=candidate_query.get('activity',['all'])[0]))
                 elif route.path == '/fan-export.js':
                     self.respond(200, Path(__file__).with_name('static').joinpath('fan-export.js').read_bytes(), 'text/javascript; charset=utf-8')
-                elif route.path in ('/theme.css','/analytics.js','/announcements.js'):
+                elif route.path in ('/theme.css','/analytics.js','/announcements.js','/fan-image.js','/v040-ui.js'):
                     content_type='text/css; charset=utf-8' if route.path.endswith('.css') else 'text/javascript; charset=utf-8'
-                    self.respond(200,Path(__file__).with_name('static').joinpath(route.path[1:]).read_bytes(),content_type)
+                    asset=Path(__file__).with_name('static').joinpath(route.path[1:])
+                    if not asset.is_file():
+                        self.respond(404,{'error':'ファイルが見つかりません。'});return
+                    self.respond(200,asset.read_bytes(),content_type)
+                elif route.path.startswith('/ocr/'):
+                    import re
+                    filename=route.path.removeprefix('/ocr/')
+                    content_types={'.js':'text/javascript; charset=utf-8','.wasm':'application/wasm',
+                        '.gz':'application/gzip','.json':'application/json; charset=utf-8','.txt':'text/plain; charset=utf-8'}
+                    asset=Path(__file__).with_name('static').joinpath('ocr',filename)
+                    if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,100}',filename)
+                            or '..' in filename or asset.suffix not in content_types or not asset.is_file()):
+                        self.respond(404,{'error':'ファイルが見つかりません。'});return
+                    content=asset.read_bytes()
+                    etag='"'+hashlib.sha256(content).hexdigest()+'"'
+                    headers={'Cache-Control':'private, no-cache','ETag':etag}
+                    if self.headers.get('If-None-Match')==etag:
+                        self.respond(304,b'',content_types[asset.suffix],headers)
+                    else:
+                        self.respond(200,content,content_types[asset.suffix],headers)
                 elif route.path == '/api/favorites/activity':
                     ids = query.get('ids', [''])[0]
                     result=webdata.favorite_activity(database, ids.split(',') if ids else [])
@@ -334,7 +383,7 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
 
         def do_POST(self):
             path=urlsplit(self.path).path
-            if path not in ('/api/fans/import','/api/fans/clear','/api/login','/api/logout','/api/favorites','/api/password','/api/account/settings','/api/admin/labels','/api/admin/users/spoon-profile','/api/admin/users/reset-password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/role','/api/admin/users/delete','/api/admin/announcements/save','/api/admin/announcements/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear')):
+            if path not in ('/api/fans/import','/api/fans/clear','/api/fans/remove','/api/login','/api/logout','/api/favorites','/api/password','/api/account/settings','/api/admin/labels','/api/admin/users/spoon-profile','/api/admin/users/reset-password','/api/admin/users/create','/api/admin/users/label','/api/admin/users/role','/api/admin/users/delete','/api/admin/announcements/save','/api/admin/announcements/delete') or (not auth and path not in ('/api/fans/import','/api/fans/clear','/api/fans/remove')):
                 self.respond(405,{'error':'この操作は利用できません。'}); return
             if path!='/api/login' and not self.gate(): return
             origin=self.headers.get('Origin')
@@ -433,6 +482,9 @@ def make_server(database, host='127.0.0.1', port=8080, *, auth=False, auth_datab
                 elif path=='/api/fans/clear':
                     self.fan_scope(fans.numeric_id(payload.get('owner_id')))
                     result=fans.clear_followers(self.private_db if auth else database,payload)
+                elif path=='/api/fans/remove':
+                    self.fan_scope(fans.numeric_id(payload.get('owner_id')))
+                    result=fans.remove_follower(self.private_db if auth else database,payload)
                 else:
                     self.fan_scope(fans._user(payload.get('owner'),True)['id'])
                     result=fans.import_followers(self.private_db if auth else database,payload)

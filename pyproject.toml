@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spoondev"
-version = "0.3.0"
+version = "0.4.0"
 description = "Stable-ID broadcaster and listener observation database"
 requires-python = ">=3.12"
 dependencies = []
@@ -16,4 +16,4 @@ spoondev = "spoondev.cli:main"
 include = ["spoondev*"]
 
 [tool.setuptools.package-data]
-spoondev = ["static/*.html", "static/*.js", "static/*.css"]
+spoondev = ["static/*.html", "static/*.js", "static/*.css", "static/ocr/*"]

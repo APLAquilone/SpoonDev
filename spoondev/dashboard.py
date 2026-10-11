@@ -11,6 +11,8 @@ from .webdata import _read
 
 _JAPAN = ZoneInfo("Asia/Tokyo")
 _LISTENER_LIMIT = 20
+_FOLLOWUP_LIMIT = 30
+_FOLLOWUP_NOTE = "保存済みの観測を時刻順に表示します。実際の移動時刻・退室・連続滞在を示すものではありません。"
 _NOTES = {
     "first_observed": "初観測は、この配信者への保存済みライブ観測で初めて見つかった日時です。初訪問を意味しません。",
     "average_temperature": "観測平均温度は、この配信者で保存された温度のあるライブ観測の平均です。月間温度とは別の値です。",
@@ -57,7 +59,8 @@ def _listeners(conn, broadcaster_id, stamp, recent_cutoff, week_start, latest_sn
     """Aggregate sightings only of the account's explicitly linked broadcaster."""
     parameters = (broadcaster_id, stamp, latest_snapshot, recent_cutoff, week_start)
     ctes = """WITH own_sightings AS (
-        SELECT m.listener_id,s.id AS snapshot_id,s.observed_at,n.name,a.tag,a.favorite_temperature,
+        SELECT m.listener_id,s.id AS snapshot_id,s.room_id,s.observed_at,s.complete,
+            n.name,a.tag,a.favorite_temperature,
             ROW_NUMBER() OVER(PARTITION BY m.listener_id ORDER BY s.observed_at DESC,s.id DESC) AS latest
         FROM snapshots s JOIN memberships m ON m.snapshot_id=s.id
         LEFT JOIN names n ON n.snapshot_id=s.id AND n.user_id=m.listener_id
@@ -72,6 +75,7 @@ def _listeners(conn, broadcaster_id, stamp, recent_cutoff, week_start, latest_sn
     ), listeners AS (
         SELECT t.listener_id AS id,COALESCE(l.name,u.name,'名前未取得') AS name,l.tag,
             l.favorite_temperature AS latest_temperature,
+            l.snapshot_id AS own_snapshot_id,l.room_id AS own_room_id,l.complete AS own_complete,
             t.observation_count,t.temperature_observation_count,t.observed_average_temperature,
             t.first_seen_at,t.last_seen_at,t.in_latest_snapshot,
             t.last_seen_at>=? AS recent,t.first_seen_at>=? AS newly_observed
@@ -104,6 +108,144 @@ def _listeners(conn, broadcaster_id, stamp, recent_cutoff, week_start, latest_sn
             users.append(user)
         lists[key] = users
     return counts, lists
+
+
+def _observation(row):
+    """A recorded positive sighting; unknown temperature is never filled in."""
+    return {
+        "snapshot_id": row["snapshot_id"], "room_id": row["room_id"],
+        "user_id": row["broadcaster_id"], "name": row["broadcaster_name"],
+        "tag": row["broadcaster_tag"], "observed_at": row["observed_at"],
+        "favorite_temperature": row["favorite_temperature"],
+        "complete": bool(row["complete"]),
+    }
+
+
+_OBSERVATION_COLUMNS = """s.id AS snapshot_id,s.room_id,s.broadcaster_id,s.observed_at,s.complete,
+    COALESCE(n.name,u.name,'名前未取得') AS broadcaster_name,a.tag AS broadcaster_tag,
+    listener.favorite_temperature"""
+_OBSERVATION_JOINS = """LEFT JOIN names n ON n.snapshot_id=s.id AND n.user_id=s.broadcaster_id
+    LEFT JOIN users u ON u.id=s.broadcaster_id
+    LEFT JOIN user_attributes a ON a.snapshot_id=s.id AND a.user_id=s.broadcaster_id
+    LEFT JOIN user_attributes listener ON listener.snapshot_id=s.id AND listener.user_id=m.listener_id"""
+
+
+def _listener_activity(conn, groups, broadcaster_id, now):
+    """Enrich the bounded account cohort in batches, separate from its own scope."""
+    from . import webdata
+
+    by_id = {}
+    for group in groups:
+        for user in group:
+            by_id.setdefault(user["id"], []).append(user)
+    if not by_id:
+        return
+    ids = list(by_id)
+    placeholders = ",".join("?" for _ in ids)
+    target_sql = "VALUES " + ",".join("(?)" for _ in ids)
+    # The latest location remains useful even when the last own-frame visit is
+    # old. A single indexed query covers the cohort, rather than one request or
+    # a full history response per listener.
+    rows = conn.execute(f"""WITH targets(id) AS ({target_sql})
+        SELECT t.id AS listener_id,{_OBSERVATION_COLUMNS}
+        FROM targets t JOIN snapshots s ON s.id=(
+            SELECT point.id FROM memberships member JOIN snapshots point ON point.id=member.snapshot_id
+            WHERE member.listener_id=t.id AND point.observed_at<=?
+            ORDER BY point.observed_at DESC,point.id DESC LIMIT 1)
+        JOIN memberships m ON m.snapshot_id=s.id AND m.listener_id=t.id
+        {_OBSERVATION_JOINS}""", [*ids, now.isoformat(timespec="microseconds")]).fetchall()
+    latest = {row["listener_id"]: _observation(row) for row in rows}
+    own_snapshots = list(dict.fromkeys(user["own_snapshot_id"] for group in groups for user in group))
+    own_rows = conn.execute(f"""SELECT {_OBSERVATION_COLUMNS},m.listener_id
+        FROM snapshots s JOIN memberships m ON m.snapshot_id=s.id
+        {_OBSERVATION_JOINS}
+        WHERE s.id IN ({','.join('?' for _ in own_snapshots)})
+          AND m.listener_id IN ({placeholders}) AND s.broadcaster_id=?""",
+        [*own_snapshots, *ids, broadcaster_id]).fetchall()
+    own = {(row["listener_id"], row["snapshot_id"]): _observation(row) for row in own_rows}
+    window = webdata._current_observation_window(conn, now)
+    parameters = webdata._activity_parameters(now, window)
+    parameters.update({f"listener{i}": uid for i, uid in enumerate(ids)})
+    activity_sql = " UNION ALL ".join(f"SELECT :listener{i} AS id" for i in range(len(ids)))
+    activity = {row["id"]: dict(row) for row in conn.execute(
+        "WITH " + webdata._activity_ctes(activity_sql,
+            include_room_attempts=webdata._has_room_attempts(conn)) + " SELECT * FROM activity_rows", parameters)}
+    users = []
+    for uid, instances in by_id.items():
+        for user in instances:
+            user["own_observation"] = own.get((uid, user.pop("own_snapshot_id")))
+            user.pop("own_room_id")
+            user.pop("own_complete")
+            user["own_recent"] = user["recent"]
+            user["latest_observation"] = latest.get(uid)
+            user.update(activity[uid])
+            user["recent"] = bool(user["recent"])
+            user["current"] = bool(user["current"])
+            user["current_seconds"] = window
+        users.append(instances[0])
+    webdata._add_destinations(conn, users, now)
+    for uid, instances in by_id.items():
+        for user in instances[1:]:
+            user["live"] = instances[0]["live"]
+            user["monthly"] = instances[0]["monthly"]
+
+
+def listener_followup(database, private_database, user_id, *, limit=_FOLLOWUP_LIMIT,
+                      before_id=None, now=None):
+    """Page later positive sightings for a listener of this account's own DJ.
+
+    The caller supplies its authenticated private database, never an owner ID.
+    Pagination is by observation time and snapshot ID; insertion order alone
+    cannot describe chronology. Same-time sightings are not "after" the anchor.
+    """
+    if not isinstance(user_id, str) or not user_id.isdecimal():
+        raise ValueError("user_id requires a numeric ID")
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("limit must be an integer between 1 and 100")
+    if before_id is not None and (type(before_id) is not int or before_id <= 0):
+        raise ValueError("before_id must be a positive integer")
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now requires timezone")
+    stamp = now.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    profile, _, _ = _settings(private_database)
+    result = {"state": "needs_profile" if profile is None else "not_observed",
+              "profile": profile, "user_id": user_id, "baseline": None,
+              "observations": [], "has_more": False, "next_before_id": None,
+              "checked_at": stamp, "note": _FOLLOWUP_NOTE}
+    if profile is None:
+        return result
+    with _read(database) as conn:
+        row = conn.execute(f"""SELECT {_OBSERVATION_COLUMNS}
+            FROM memberships m JOIN snapshots s ON s.id=m.snapshot_id
+            {_OBSERVATION_JOINS}
+            WHERE m.listener_id=? AND s.broadcaster_id=? AND s.observed_at<=?
+            ORDER BY s.observed_at DESC,s.id DESC LIMIT 1""", (user_id, profile["id"], stamp)).fetchone()
+        if row is None:
+            return result
+        baseline = _observation(row)
+        result.update(state="ready", baseline=baseline)
+        parameters = [user_id, baseline["observed_at"], stamp]
+        cursor_where = ""
+        if before_id is not None:
+            cursor = conn.execute("""SELECT s.observed_at,s.id FROM snapshots s
+                JOIN memberships m ON m.snapshot_id=s.id WHERE s.id=? AND m.listener_id=?
+                  AND s.observed_at>? AND s.observed_at<=?""",
+                (before_id, user_id, baseline["observed_at"], stamp)).fetchone()
+            if cursor is None:
+                raise ValueError("before_id is not a later observation of this listener")
+            cursor_where = " AND (s.observed_at<? OR (s.observed_at=? AND s.id<?))"
+            parameters.extend([cursor["observed_at"], cursor["observed_at"], cursor["id"]])
+        rows = conn.execute(f"""SELECT {_OBSERVATION_COLUMNS}
+            FROM memberships m JOIN snapshots s ON s.id=m.snapshot_id
+            {_OBSERVATION_JOINS}
+            WHERE m.listener_id=? AND s.observed_at>? AND s.observed_at<=?{cursor_where}
+            ORDER BY s.observed_at DESC,s.id DESC LIMIT ?""", [*parameters, limit + 1]).fetchall()
+        result["observations"] = [_observation(row) for row in rows[:limit]]
+        result["has_more"] = len(rows) > limit
+        if result["has_more"]:
+            result["next_before_id"] = result["observations"][-1]["snapshot_id"]
+    return result
 
 
 def _monthly(conn, broadcaster_id, month, stamp):
@@ -199,6 +341,8 @@ def summary(database, private_database=None, *, now=None):
             )
             result["recent_listeners"] = users["recent"]
             result["newly_observed_listeners"] = users["new"]
+            _listener_activity(conn, (users["latest"], users["recent"], users["new"]),
+                               broadcaster_id, now)
             by_day = {day["date"]: day for day in result["daily"]}
             rows = conn.execute("""SELECT date(s.observed_at,'+9 hours') AS day,
                 COUNT(DISTINCT m.listener_id) AS listeners,COUNT(DISTINCT s.id) AS snapshots

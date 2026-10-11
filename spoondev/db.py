@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS observation_attempts (
  page_count INTEGER NOT NULL CHECK(page_count>=0), state TEXT NOT NULL,
  snapshot_id INTEGER UNIQUE REFERENCES snapshots(id) ON DELETE SET NULL);
 CREATE INDEX IF NOT EXISTS observation_attempts_room ON observation_attempts(room_id,finished_at);
+CREATE INDEX IF NOT EXISTS observation_attempts_broadcaster ON observation_attempts(broadcaster_id,finished_at);
 """
 
 @contextmanager
